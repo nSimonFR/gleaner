@@ -19,7 +19,7 @@
             pname = "gleaner";
             version = "0.0.1";
             src = ./.;
-            vendorHash = null; # no external deps in v0.0.1
+            vendorHash = null; # vendored locally via `go mod vendor`
             subPackages = [ "cmd/gleaner" ];
             ldflags = [ "-s" "-w" ];
             meta = with pkgs.lib; {

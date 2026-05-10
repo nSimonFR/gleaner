@@ -26,6 +26,10 @@ func main() {
 	switch cmd {
 	case "snapshot":
 		os.Exit(snapshotCmd(ctx, args))
+	case "drain":
+		os.Exit(drainCmd(ctx, args))
+	case "bootstrap":
+		os.Exit(bootstrapCmd(ctx, args))
 	case "version", "--version", "-v":
 		fmt.Println("gleaner", version)
 	case "help", "-h", "--help":
@@ -41,10 +45,16 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `gleaner %s — quota-aware coding-agent dispatcher
 
 usage:
-  gleaner snapshot [--json]     print current quota utilization for both providers
+  gleaner snapshot [--json]            print current quota utilization
+  gleaner drain --config <yaml> [--dry-run]
+                                       evaluate predicate; if it passes,
+                                       dispatch one issue and open one PR.
+                                       Single-shot in v0.0.2.
+  gleaner bootstrap --config <yaml>    create the 9 gleaner labels on each
+                                       configured repo (idempotent).
   gleaner version
   gleaner help
 
-v0.0.1: snapshot is the only subcommand. drain/serve land in v0.0.2/v0.0.3.
+v0.0.2: drain is single-shot. The serve daemon lands in v0.0.3.
 `, version)
 }
