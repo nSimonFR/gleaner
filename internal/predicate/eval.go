@@ -50,22 +50,19 @@ func Evaluate(ctx context.Context, in Inputs) Decision {
 	}
 
 	// 2. Hours of day.
+	//   - In drain window: proceed with idle threshold (more permissive).
+	//   - In active window: proceed with active threshold (stricter).
+	//   - In neither: deny outright.
 	now := in.Now
 	if now.IsZero() {
 		now = time.Now()
 	}
-	if !inDrainWindow(now, cfg.Hours.Drain) {
-		isActive := inDrainWindow(now, cfg.Hours.Active)
-		if isActive {
-			// During active hours we still allow if utilization is fresh.
-			// That's handled in the quota guards below — but if hours.Drain
-			// excluded right now, only fresh quota saves us.
-		} else {
-			return deny("outside_drain_hours (now=%s drain=%s active=%s)",
-				now.Format("15:04"), cfg.Hours.Drain, cfg.Hours.Active)
-		}
-	}
+	inDrain := inDrainWindow(now, cfg.Hours.Drain)
 	isActiveHour := inDrainWindow(now, cfg.Hours.Active)
+	if !inDrain && !isActiveHour {
+		return deny("outside_drain_hours (now=%s drain=%s active=%s)",
+			now.Format("15:04"), cfg.Hours.Drain, cfg.Hours.Active)
+	}
 
 	// 3. Quota windows — every provider must clear short_window guard.
 	for _, src := range in.QuotaSources {
@@ -150,12 +147,31 @@ func parseTimeRange(rng string) (start, end int, ok bool) {
 	return 0, 0, false
 }
 
+// parseHHMM accepts H:MM or HH:MM. Users routinely write "9:00".
 func parseHHMM(s string) (int, bool) {
-	if len(s) != 5 || s[2] != ':' {
+	colon := -1
+	for i, c := range s {
+		if c == ':' {
+			colon = i
+			break
+		}
+	}
+	if colon < 1 || len(s)-colon-1 != 2 {
 		return 0, false
 	}
-	h := int(s[0]-'0')*10 + int(s[1]-'0')
-	m := int(s[3]-'0')*10 + int(s[4]-'0')
+	hStr := s[:colon]
+	mStr := s[colon+1:]
+	h := 0
+	for _, c := range hStr {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		h = h*10 + int(c-'0')
+	}
+	if mStr[0] < '0' || mStr[0] > '9' || mStr[1] < '0' || mStr[1] > '9' {
+		return 0, false
+	}
+	m := int(mStr[0]-'0')*10 + int(mStr[1]-'0')
 	if h < 0 || h > 23 || m < 0 || m > 59 {
 		return 0, false
 	}

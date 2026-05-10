@@ -74,8 +74,9 @@ func Run(ctx context.Context, prof *config.Profile, iss *github.Issue, workTreeR
 
 	cmd := exec.CommandContext(cctx, rendered[0], rendered[1:]...)
 	cmd.Dir = renderedCwd
+	// Prefix with GLEANER_ to avoid clobbering common env names like PROMPT.
 	cmd.Env = append(os.Environ(),
-		"PROMPT="+vars["prompt"],
+		"GLEANER_PROMPT="+vars["prompt"],
 		"GLEANER_WORKTREE="+wt,
 		"GLEANER_REPO="+iss.Repo,
 		"GLEANER_ISSUE="+vars["issue_number"],
@@ -99,11 +100,11 @@ func Run(ctx context.Context, prof *config.Profile, iss *github.Issue, workTreeR
 	}
 	result.ExitCode = 0
 
-	// 4. Inspect worktree changes.
-	diffCmd := exec.CommandContext(ctx, "git", "diff", "--quiet")
-	diffCmd.Dir = wt
-	if err := diffCmd.Run(); err != nil {
-		// Non-zero = changes present.
+	// 4. Inspect worktree changes — `status --porcelain` catches BOTH
+	// modifications to tracked files AND new untracked files. A bare
+	// `git diff --quiet` would miss new-file dispatches entirely.
+	statusCmd := exec.CommandContext(ctx, "git", "-C", wt, "status", "--porcelain")
+	if out, err := statusCmd.Output(); err == nil && len(strings.TrimSpace(string(out))) > 0 {
 		result.HasChanges = true
 	}
 	headCmd := exec.CommandContext(ctx, "git", "rev-parse", "HEAD")
@@ -144,13 +145,17 @@ func setupWorkTree(ctx context.Context, repo string, issueNum int, title, root s
 	if slug == "" {
 		slug = "task"
 	}
-	branch := fmt.Sprintf("afk/%s-%d-%s", repoBase, issueNum, slug)
-	wtName := fmt.Sprintf("%s-%d", repoBase, issueNum)
+	// Append a unix-second suffix so successive runs against the same issue
+	// don't collide on the worktree path. The branch name also includes it
+	// so retries don't clobber unpushed work.
+	suffix := fmt.Sprintf("%d", time.Now().Unix())
+	branch := fmt.Sprintf("afk/%s-%d-%s-%s", repoBase, issueNum, slug, suffix)
+	wtName := fmt.Sprintf("%s-%d-%s", repoBase, issueNum, suffix)
 	wt := filepath.Join(root, wtName)
 
-	// gleaner doesn't ship with the source repo. Caller must have a local
-	// clone available at $HOME/<repoBase> (matches user's convention for
-	// sure-nix, for-sure, etc.). We use that as the source.
+	// Source repo: gleaner doesn't ship clones. Caller must have a local
+	// clone at $HOME/<repoBase> (matches the user's `sure-nix`/`for-sure`
+	// convention). Configurable in v0.1+ via config.clones_dir.
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", "", fmt.Errorf("home: %w", err)
@@ -160,16 +165,46 @@ func setupWorkTree(ctx context.Context, repo string, issueNum int, title, root s
 		return "", "", fmt.Errorf("source repo not found at %s (expected for %s)", sourceRepo, repo)
 	}
 
+	// Fetch origin so we branch from current main, not stale local state.
+	fetchCmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "fetch", "--quiet", "origin")
+	var fetchStderr bytes.Buffer
+	fetchCmd.Stderr = &fetchStderr
+	if err := fetchCmd.Run(); err != nil {
+		return "", "", fmt.Errorf("git fetch %s: %w (%s)", sourceRepo, err, fetchStderr.String())
+	}
+
+	// Detect default branch (handles main / master / develop).
+	base, err := defaultBranch(ctx, sourceRepo)
+	if err != nil {
+		return "", "", fmt.Errorf("default branch %s: %w", sourceRepo, err)
+	}
+
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return "", "", err
 	}
-	cmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "worktree", "add", "-b", branch, wt, "origin/main")
+	cmd := exec.CommandContext(ctx, "git", "-C", sourceRepo, "worktree", "add", "-b", branch, wt, "origin/"+base)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		return "", "", fmt.Errorf("worktree add: %w (%s)", err, stderr.String())
 	}
 	return wt, branch, nil
+}
+
+// defaultBranch returns the name of `origin/HEAD`'s ref (e.g. "main",
+// "master", "develop"). Falls back to "main" if introspection fails.
+func defaultBranch(ctx context.Context, sourceRepo string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", "-C", sourceRepo,
+		"symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+	out, err := cmd.Output()
+	if err != nil {
+		return "main", nil // permissive fallback
+	}
+	ref := strings.TrimSpace(string(out))
+	if i := strings.Index(ref, "/"); i >= 0 {
+		return ref[i+1:], nil
+	}
+	return ref, nil
 }
 
 func cleanupWorkTree(wt string) {

@@ -82,9 +82,8 @@ func serveCmd(ctx context.Context, args []string) int {
 	}
 }
 
-// runDispatchOnce is a thin wrapper around drain's dispatch path. It
-// reuses the same pickIssue / executor / PR flow without exiting on
-// no-eligible-issue (which is informational, not a failure for `serve`).
+// runDispatchOnce reuses drain's pickIssue + dispatchAndOpenPR. Logs but
+// does NOT propagate errors — the serve loop must continue across failures.
 func runDispatchOnce(ctx context.Context, cfg *config.Config, gh *github.Client, wtRoot string) {
 	issue, profile, err := pickIssue(ctx, gh, cfg)
 	if err != nil {
@@ -95,8 +94,7 @@ func runDispatchOnce(ctx context.Context, cfg *config.Config, gh *github.Client,
 		fmt.Println("no eligible issues")
 		return
 	}
-	// Delegate to the same path drain uses by reconstructing args; cleanest
-	// approach is to call drainCmd's helper directly, but we keep this here
-	// for clarity. The orchestration block is small; duplication is fine.
-	dispatchAndOpenPR(ctx, cfg, gh, issue, profile, wtRoot)
+	if err := dispatchAndOpenPR(ctx, cfg, gh, issue, profile, wtRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "dispatch error: %v\n", err)
+	}
 }

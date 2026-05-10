@@ -26,21 +26,22 @@ func New(account string) *Client {
 
 // EnforceAuth verifies the active gh user matches c.Account. Run this once
 // at startup; gh remembers the active user across invocations.
+//
+// Implementation note: we use `gh api user --jq .login` rather than parsing
+// `gh auth status` output. The latter is localized prose that changes
+// across gh versions; the former is a stable JSON-API call that gh routes
+// through whichever account is currently active.
 func (c *Client) EnforceAuth(ctx context.Context) error {
 	if c.Account == "" {
 		return fmt.Errorf("github: Account is required (e.g. nSimonFR-ai)")
 	}
-	out, err := c.run(ctx, "auth", "status", "--active")
+	out, err := c.run(ctx, "api", "user", "--jq", ".login")
 	if err != nil {
-		return fmt.Errorf("github: gh auth status failed (run `gh auth login`?): %w", err)
+		return fmt.Errorf("github: gh api user failed (run `gh auth login`?): %w", err)
 	}
-	// `gh auth status --active` writes lines like:
-	//   ✓ Logged in to github.com account nSimonFR-ai (oauth_token)
-	// GitHub usernames are case-insensitive; gh may display them in
-	// lowercase. Match case-insensitively to avoid false negatives.
-	want := strings.ToLower("account " + c.Account)
-	if !strings.Contains(strings.ToLower(out), want) {
-		return fmt.Errorf("github: active gh account is not %s\n\n%s\nRun: gh auth switch -u %s", c.Account, out, c.Account)
+	got := strings.TrimSpace(out)
+	if !strings.EqualFold(got, c.Account) {
+		return fmt.Errorf("github: active gh account is %q but config wants %q\nRun: gh auth switch -u %s", got, c.Account, c.Account)
 	}
 	return nil
 }
@@ -121,7 +122,8 @@ func (c *Client) CountOpenInflight(ctx context.Context, repos []string) (int, er
 
 // MergedThisWeek returns the count of PRs across `repos` with the `afk` label
 // that were merged within the last 7 days. Used for the anti-goal protection
-// metric `merged_this_week`.
+// metric `merged_this_week` exposed in v0.0.4's /status endpoint. Wired here
+// at v0.0.2 so the API surface is stable when the HTTP server arrives.
 func (c *Client) MergedThisWeek(ctx context.Context, repos []string) (int, error) {
 	since := time.Now().UTC().Add(-7 * 24 * time.Hour).Format("2006-01-02")
 	total := 0

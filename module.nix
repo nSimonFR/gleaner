@@ -16,8 +16,14 @@ in {
 
     user = mkOption {
       type = types.str;
-      default = "gleaner";
-      description = "User the gleaner service runs as. Must own ~/.claude/projects and ~/.codex/sessions.";
+      description = ''
+        User the gleaner service runs as. Must own ~/.claude/projects
+        and ~/.codex/sessions and have read access to ~/.claude/.credentials.json.
+        No default — gleaner is always run as a real human user on this
+        host (it reads that user's quota journals); creating a synthetic
+        "gleaner" user would mean no journals to read.
+      '';
+      example = "nsimon";
     };
 
     configFile = mkOption {

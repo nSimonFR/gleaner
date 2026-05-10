@@ -18,6 +18,7 @@ package codex_journal
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -187,7 +188,7 @@ func scanFile(path string) (*rateLimits, time.Time, bool) {
 	for sc.Scan() {
 		line := sc.Bytes()
 		// Quick prefilter — avoid full unmarshal for non-matching lines.
-		if !bytes_contains(line, []byte(`"token_count"`)) {
+		if !bytes.Contains(line, []byte(`"token_count"`)) {
 			continue
 		}
 		var ev eventEnvelope
@@ -199,7 +200,9 @@ func scanFile(path string) (*rateLimits, time.Time, bool) {
 		}
 		t, err := time.Parse(time.RFC3339Nano, ev.Timestamp)
 		if err != nil {
-			t = time.Now()
+			// Skip events with malformed timestamps; using time.Now() here
+			// would let bad data win the "most recent" race.
+			continue
 		}
 		lastRL = ev.Payload.RateLimits
 		lastTime = t
@@ -210,23 +213,3 @@ func scanFile(path string) (*rateLimits, time.Time, bool) {
 	return lastRL, lastTime, true
 }
 
-// bytes_contains is a minimal substring check on a byte slice, avoiding
-// the cost of bringing in "bytes" just for one call. (Inlined for clarity.)
-func bytes_contains(haystack, needle []byte) bool {
-	if len(needle) == 0 {
-		return true
-	}
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		match := true
-		for j := 0; j < len(needle); j++ {
-			if haystack[i+j] != needle[j] {
-				match = false
-				break
-			}
-		}
-		if match {
-			return true
-		}
-	}
-	return false
-}

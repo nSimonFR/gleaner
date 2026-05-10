@@ -30,17 +30,15 @@ var gleanerLabels = []gleanerLabel{
 func bootstrapCmd(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("bootstrap", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "path to YAML config (uses .repos and .account)")
-	repoOverride := fs.String("repo", "", "single repo (owner/name) instead of config.repos")
+	repoOverride := fs.String("repo", "", "single repo (owner/name); overrides config.repos but still requires --config for .account")
+	accountFlag := fs.String("account", "", "GitHub account (e.g. nSimonFR-ai); overrides config.account. Required if --config is not given.")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 
 	var repos []string
 	var account string
-	if *repoOverride != "" {
-		repos = []string{*repoOverride}
-		account = inferAccountFromGH(ctx)
-	} else {
+	if *cfgPath != "" {
 		cfg, err := config.Load(*cfgPath)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "config:", err)
@@ -48,6 +46,12 @@ func bootstrapCmd(ctx context.Context, args []string) int {
 		}
 		repos = cfg.Repos
 		account = cfg.Account
+	}
+	if *repoOverride != "" {
+		repos = []string{*repoOverride}
+	}
+	if *accountFlag != "" {
+		account = *accountFlag
 	}
 
 	if account == "" {
@@ -78,10 +82,3 @@ func bootstrapCmd(ctx context.Context, args []string) int {
 	return 0
 }
 
-// inferAccountFromGH is a placeholder for v0.0.2 — always returns "" so
-// `--repo` callers must explicitly pass `--config <yaml>` containing the
-// `account:` key. Simpler than parsing `gh auth status` output, and any
-// auth mismatch is caught by EnforceAuth before damage is done.
-func inferAccountFromGH(_ context.Context) string {
-	return ""
-}

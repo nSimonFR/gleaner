@@ -32,11 +32,11 @@ type Hours struct {
 }
 
 type Guards struct {
-	InflightPRs        int     `yaml:"inflight_prs"`
-	AbortIfStep        float64 `yaml:"abort_if_step"`
-	ShortWindowIdle    float64 `yaml:"short_window_idle"`
-	ShortWindowActive  float64 `yaml:"short_window_active"`
-	LongWindowCeiling  float64 `yaml:"long_window_ceiling"`
+	InflightPRs       int     `yaml:"inflight_prs"`
+	AbortIfStep       float64 `yaml:"abort_if_step"` // reserved for v0.0.4 delta-safety abort (one tool-call burning > this % of short window)
+	ShortWindowIdle   float64 `yaml:"short_window_idle"`
+	ShortWindowActive float64 `yaml:"short_window_active"`
+	LongWindowCeiling float64 `yaml:"long_window_ceiling"`
 }
 
 type Profile struct {
