@@ -80,10 +80,20 @@ func drainCmd(ctx context.Context, args []string) int {
 		fmt.Println("skip: no_eligible_issues")
 		return 0
 	}
+	if err := dispatchAndOpenPR(ctx, cfg, gh, issue, profile, *workTreeRoot); err != nil {
+		return 1
+	}
+	return 0
+}
+
+// dispatchAndOpenPR runs `profile` against `issue` in a worktree, and if
+// the profile's on_success == open_pr and the worktree has changes, opens
+// a PR. Used by both `drain` and `serve`. Returns nil on the full success
+// path or on no-change skips; returns error only on hard failures.
+func dispatchAndOpenPR(ctx context.Context, cfg *config.Config, gh *github.Client, issue *github.Issue, profile *config.Profile, workTreeRoot string) error {
 	fmt.Printf("dispatch: %s#%d → profile=%s (%s)\n", issue.Repo, issue.Number, profile.Name, strings.Join(profile.Run, " "))
 
-	// Run the executor.
-	res, runErr := executor.Run(ctx, profile, issue, *workTreeRoot, false)
+	res, runErr := executor.Run(ctx, profile, issue, workTreeRoot, false)
 	if runErr != nil {
 		fmt.Fprintf(os.Stderr, "dispatch_failed: exit=%d err=%v\n", res.ExitCode, runErr)
 		fireHook(cfg.Hook, "dispatch_failed", map[string]any{
@@ -92,34 +102,34 @@ func drainCmd(ctx context.Context, args []string) int {
 			"task_id":  fmt.Sprintf("github:%s#%d", issue.Repo, issue.Number),
 			"exitcode": res.ExitCode,
 		})
-		return 1
+		return runErr
 	}
 	fmt.Printf("dispatch_ok: branch=%s changes=%v duration=%dms\n", res.Branch, res.HasChanges, res.DurationMs)
 
-	if profile.OnSuccess == "open_pr" && res.HasChanges {
-		// Push the branch and open a PR.
-		if err := pushBranch(ctx, res.WorkTree, res.Branch); err != nil {
-			fmt.Fprintln(os.Stderr, "push:", err)
-			return 1
-		}
-		prBody := buildPRBody(issue, profile, res)
-		url, err := gh.CreatePR(ctx, issue.Repo, "main", res.Branch,
-			fmt.Sprintf("afk: %s", issue.Title), prBody,
-			[]string{"afk", "needs-review"})
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "pr_create:", err)
-			return 1
-		}
-		fmt.Printf("pr_opened: %s\n", url)
-		fireHook(cfg.Hook, "pr_opened", map[string]any{
-			"pr":       map[string]any{"url": url, "branch": res.Branch},
-			"profile":  profile.Name,
-			"task_id":  fmt.Sprintf("github:%s#%d", issue.Repo, issue.Number),
-		})
-	} else {
-		fmt.Printf("dispatch_ok: on_success=%s changes=%v — no PR opened\n", profile.OnSuccess, res.HasChanges)
+	if profile.OnSuccess != "open_pr" || !res.HasChanges {
+		fmt.Printf("on_success=%s changes=%v — no PR opened\n", profile.OnSuccess, res.HasChanges)
+		return nil
 	}
-	return 0
+
+	if err := pushBranch(ctx, res.WorkTree, res.Branch); err != nil {
+		fmt.Fprintln(os.Stderr, "push:", err)
+		return err
+	}
+	prBody := buildPRBody(issue, profile, res)
+	url, err := gh.CreatePR(ctx, issue.Repo, "main", res.Branch,
+		fmt.Sprintf("afk: %s", issue.Title), prBody,
+		[]string{"afk", "needs-review"})
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "pr_create:", err)
+		return err
+	}
+	fmt.Printf("pr_opened: %s\n", url)
+	fireHook(cfg.Hook, "pr_opened", map[string]any{
+		"pr":      map[string]any{"url": url, "branch": res.Branch},
+		"profile": profile.Name,
+		"task_id": fmt.Sprintf("github:%s#%d", issue.Repo, issue.Number),
+	})
+	return nil
 }
 
 func pickIssue(ctx context.Context, gh *github.Client, cfg *config.Config) (*github.Issue, *config.Profile, error) {

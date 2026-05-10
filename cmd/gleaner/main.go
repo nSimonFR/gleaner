@@ -28,6 +28,8 @@ func main() {
 		os.Exit(snapshotCmd(ctx, args))
 	case "drain":
 		os.Exit(drainCmd(ctx, args))
+	case "serve":
+		os.Exit(serveCmd(ctx, args))
 	case "bootstrap":
 		os.Exit(bootstrapCmd(ctx, args))
 	case "version", "--version", "-v":
@@ -50,11 +52,11 @@ usage:
                                        evaluate predicate; if it passes,
                                        dispatch one issue and open one PR.
                                        Single-shot in v0.0.2.
+  gleaner serve --config <yaml>        long-running daemon. polls every
+                                       hours.poll, runs drain on each tick.
   gleaner bootstrap --config <yaml>    create the 9 gleaner labels on each
                                        configured repo (idempotent).
   gleaner version
   gleaner help
-
-v0.0.2: drain is single-shot. The serve daemon lands in v0.0.3.
 `, version)
 }

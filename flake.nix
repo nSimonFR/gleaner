@@ -37,5 +37,10 @@
             packages = [ pkgs.go pkgs.gopls pkgs.golangci-lint ];
           };
         };
+
+      flake = {
+        nixosModules.gleaner = import ./module.nix self;
+        nixosModules.default = self.nixosModules.gleaner;
+      };
     };
 }
