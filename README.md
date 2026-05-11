@@ -14,6 +14,23 @@ blocking your live work and without drowning you in PRs to review on Monday.
 
 ---
 
+## AI Installation Prompt
+
+> Install `gleaner` on a generic Linux or macOS host. **Done when** `gleaner snapshot` prints a non-empty utilization line for `claude` or `codex`.
+>
+> 1. Clone: `git clone https://github.com/nSimonFR/gleaner && cd gleaner`
+> 2. Read first: `README.md`, `go.mod`, `flake.nix`, `examples/` if present. Toolchain is Go ≥ 1.25.
+> 3. Build (try in this order, stop at the first that works):
+>    - `nix build && cp result/bin/gleaner ~/.local/bin/`
+>    - `go build -o ~/.local/bin/gleaner ./cmd/gleaner`
+>    Verify: `gleaner --help` lists `snapshot`, `drain`, `serve`, `bootstrap`.
+> 4. Prerequisites for `snapshot` to return real data:
+>    - Claude: `~/.claude/.credentials.json` exists with a fresh OAuth token (run `claude /login` once if missing).
+>    - Codex: at least one session journal at `~/.codex/sessions/**/*.jsonl` (run `codex` once if missing).
+> 5. For daemon mode: write a `gleaner.config.yaml` (see the **Config** section below; the 7-line example is enough), then `gleaner serve --config gleaner.config.yaml`. NixOS hosts can use `services.gleaner` instead — see `module.nix`.
+> 6. Before any GitHub op against the user's repos, run `gh auth switch -u nSimonFR-ai` (the bot account, not the personal one).
+>
+> **Never invoke `claude` or `codex` as a subprocess to read quota** — gleaner does it for free via the journals, and shelling out burns tokens against the very window we're measuring.
 ## Status
 
 **v0.0.3** — four subcommands ship; the daemon is deployed on the author's
@@ -140,32 +157,6 @@ identical evaluation, longer-lived process. Layout:
 
 ---
 
-## Setup for AI coding agents
-
-> Install gleaner on a NixOS host:
->
-> 1. Add to flake inputs: `gleaner.url = "github:nSimonFR/gleaner";`
-> 2. Import the module: `inputs.gleaner.nixosModules.gleaner` in your rpi5/host modules list (or `imports = [ inputs.gleaner.nixosModules.gleaner ];` in a per-service file).
-> 3. Configure:
->    ```nix
->    services.gleaner = {
->      enable     = true;
->      user       = "<your-real-user>";   # must own ~/.claude/projects and ~/.codex/sessions
->      configFile = ./gleaner.config.yaml;
->    };
->    ```
->    Minimal `gleaner.config.yaml`:
->    ```yaml
->    account: <your-gh-bot-account>
->    repos:   [<owner>/<repo>, ...]
->    profiles:
->      - { match: "*", run: ["claude", "-p", "{prompt}"] }
->    ```
-> 4. `sudo nixos-rebuild switch --flake .#<host>`
-> 5. One-time: `gleaner bootstrap --config <path-to-config>` to create the 9 required labels (`afk-ready`, `complexity:{trivial,routine,hard}`, `needs-human`, `blocked`, `wip`, `afk`, `needs-review`).
-> 6. Label a test issue with `afk-ready` + `complexity:routine`. The timer dispatches on the next tick (default 10 min, drain hours 22:00–07:00).
->
-> The service is stateless: GitHub is the source of truth for inflight count, history, daily count. There is no `state.json`. If you ever feel tempted to add one, read `internal/predicate/eval.go` first — every guard query goes through `gh`.
 ## NixOS module
 
 ```nix
