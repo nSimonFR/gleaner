@@ -97,6 +97,11 @@ func Defaults() Config {
 }
 
 // Load reads a YAML file and overlays it onto Defaults().
+//
+// Overlay semantics: explicit user values override defaults; omitted keys
+// inherit defaults. Implementation uses a pointer-bearing overlay struct
+// so a user can disable a guard with `inflight_prs: 0` (or any other
+// zero value) — the merger only copies fields whose pointer is non-nil.
 func Load(path string) (*Config, error) {
 	cfg := Defaults()
 	if path == "" {
@@ -107,12 +112,11 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("read %s: %w", path, err)
 	}
 
-	// Decode user file into an overlay struct, then merge non-zero fields.
-	var overlay Config
+	var overlay configOverlay
 	if err := yaml.Unmarshal(raw, &overlay); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	mergeOverlay(&cfg, &overlay)
+	overlay.applyTo(&cfg)
 
 	// Derive profile names and plans where omitted.
 	for i := range cfg.Profiles {
@@ -140,54 +144,94 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
-func mergeOverlay(base, ov *Config) {
-	if ov.Account != "" {
-		base.Account = ov.Account
+// configOverlay mirrors Config with pointer-bearing scalars so the YAML
+// decoder leaves un-set fields as nil — distinguishing "user omitted" from
+// "user wrote 0". Each non-nil field is copied through to the merged Config.
+type configOverlay struct {
+	Account  *string             `yaml:"account"`
+	Repos    *[]string           `yaml:"repos"`
+	Require  *[]string           `yaml:"require"`
+	Block    *[]string           `yaml:"block"`
+	Hours    *hoursOverlay       `yaml:"hours"`
+	Guards   *guardsOverlay      `yaml:"guards"`
+	Profiles *[]Profile          `yaml:"profiles"`
+	Hook     *string             `yaml:"hook"`
+	Safety   *safetyOverlay      `yaml:"safety"`
+}
+
+type hoursOverlay struct {
+	Active *string        `yaml:"active"`
+	Drain  *string        `yaml:"drain"`
+	Poll   *time.Duration `yaml:"poll"`
+}
+
+type guardsOverlay struct {
+	InflightPRs       *int     `yaml:"inflight_prs"`
+	AbortIfStep       *float64 `yaml:"abort_if_step"`
+	ShortWindowIdle   *float64 `yaml:"short_window_idle"`
+	ShortWindowActive *float64 `yaml:"short_window_active"`
+	LongWindowCeiling *float64 `yaml:"long_window_ceiling"`
+}
+
+type safetyOverlay struct {
+	MaxPerDay  *int    `yaml:"max_per_day"`
+	KillSwitch *string `yaml:"kill_switch"`
+}
+
+func (ov *configOverlay) applyTo(base *Config) {
+	if ov.Account != nil {
+		base.Account = *ov.Account
 	}
-	if len(ov.Repos) > 0 {
-		base.Repos = ov.Repos
+	if ov.Repos != nil {
+		base.Repos = *ov.Repos
 	}
-	if len(ov.Require) > 0 {
-		base.Require = ov.Require
+	if ov.Require != nil {
+		base.Require = *ov.Require
 	}
-	if len(ov.Block) > 0 {
-		base.Block = ov.Block
+	if ov.Block != nil {
+		base.Block = *ov.Block
 	}
-	if ov.Hours.Active != "" {
-		base.Hours.Active = ov.Hours.Active
+	if ov.Hours != nil {
+		if ov.Hours.Active != nil {
+			base.Hours.Active = *ov.Hours.Active
+		}
+		if ov.Hours.Drain != nil {
+			base.Hours.Drain = *ov.Hours.Drain
+		}
+		if ov.Hours.Poll != nil {
+			base.Hours.Poll = *ov.Hours.Poll
+		}
 	}
-	if ov.Hours.Drain != "" {
-		base.Hours.Drain = ov.Hours.Drain
+	if ov.Guards != nil {
+		if ov.Guards.InflightPRs != nil {
+			base.Guards.InflightPRs = *ov.Guards.InflightPRs
+		}
+		if ov.Guards.AbortIfStep != nil {
+			base.Guards.AbortIfStep = *ov.Guards.AbortIfStep
+		}
+		if ov.Guards.ShortWindowIdle != nil {
+			base.Guards.ShortWindowIdle = *ov.Guards.ShortWindowIdle
+		}
+		if ov.Guards.ShortWindowActive != nil {
+			base.Guards.ShortWindowActive = *ov.Guards.ShortWindowActive
+		}
+		if ov.Guards.LongWindowCeiling != nil {
+			base.Guards.LongWindowCeiling = *ov.Guards.LongWindowCeiling
+		}
 	}
-	if ov.Hours.Poll != 0 {
-		base.Hours.Poll = ov.Hours.Poll
+	if ov.Profiles != nil {
+		base.Profiles = *ov.Profiles
 	}
-	if ov.Guards.InflightPRs != 0 {
-		base.Guards.InflightPRs = ov.Guards.InflightPRs
+	if ov.Hook != nil {
+		base.Hook = *ov.Hook
 	}
-	if ov.Guards.AbortIfStep != 0 {
-		base.Guards.AbortIfStep = ov.Guards.AbortIfStep
-	}
-	if ov.Guards.ShortWindowIdle != 0 {
-		base.Guards.ShortWindowIdle = ov.Guards.ShortWindowIdle
-	}
-	if ov.Guards.ShortWindowActive != 0 {
-		base.Guards.ShortWindowActive = ov.Guards.ShortWindowActive
-	}
-	if ov.Guards.LongWindowCeiling != 0 {
-		base.Guards.LongWindowCeiling = ov.Guards.LongWindowCeiling
-	}
-	if len(ov.Profiles) > 0 {
-		base.Profiles = ov.Profiles
-	}
-	if ov.Hook != "" {
-		base.Hook = ov.Hook
-	}
-	if ov.Safety.MaxPerDay != 0 {
-		base.Safety.MaxPerDay = ov.Safety.MaxPerDay
-	}
-	if ov.Safety.KillSwitch != "" {
-		base.Safety.KillSwitch = ov.Safety.KillSwitch
+	if ov.Safety != nil {
+		if ov.Safety.MaxPerDay != nil {
+			base.Safety.MaxPerDay = *ov.Safety.MaxPerDay
+		}
+		if ov.Safety.KillSwitch != nil {
+			base.Safety.KillSwitch = *ov.Safety.KillSwitch
+		}
 	}
 }
 

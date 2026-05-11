@@ -116,7 +116,13 @@ func dispatchAndOpenPR(ctx context.Context, cfg *config.Config, gh *github.Clien
 		return err
 	}
 	prBody := buildPRBody(issue, profile, res)
-	url, err := gh.CreatePR(ctx, issue.Repo, "main", res.Branch,
+	// Pull the default branch from the worktree (it was branched off
+	// origin/<default>, so HEAD's upstream knows the right base).
+	base, err := worktreeBase(ctx, res.WorkTree)
+	if err != nil {
+		base = "main" // permissive fallback
+	}
+	url, err := gh.CreatePR(ctx, issue.Repo, base, res.Branch,
 		fmt.Sprintf("afk: %s", issue.Title), prBody,
 		[]string{"afk", "needs-review"})
 	if err != nil {
@@ -140,11 +146,23 @@ func pickIssue(ctx context.Context, gh *github.Client, cfg *config.Config) (*git
 		}
 		for _, iss := range issues {
 			labels := make([]string, 0, len(iss.Labels))
+			hasComplexity := false
 			for _, l := range iss.Labels {
 				labels = append(labels, l.Name)
+				if strings.HasPrefix(l.Name, "complexity:") {
+					hasComplexity = true
+				}
+			}
+			// Per the plan: missing complexity:* → skip, don't default-route.
+			// The wildcard match: "*" profile catches everything otherwise,
+			// which would route un-triaged issues to the default model.
+			if !hasComplexity {
+				fmt.Printf("skip-issue: %s#%d reason=missing_complexity_label\n", iss.Repo, iss.Number)
+				continue
 			}
 			profile := cfg.MatchProfile(labels)
 			if profile == nil {
+				fmt.Printf("skip-issue: %s#%d reason=no_matching_profile labels=%v\n", iss.Repo, iss.Number, labels)
 				continue
 			}
 			return &iss, profile, nil
@@ -160,6 +178,31 @@ func pushBranch(ctx context.Context, worktree, branch string) error {
 		return fmt.Errorf("git push: %w (%s)", err, string(out))
 	}
 	return nil
+}
+
+// worktreeBase returns the short name of the branch the worktree was
+// branched from. We stamped it as a config value in setupWorkTree:
+//   `git config --local gleaner.base <base>` runs there.
+// Falls back to reading `origin/HEAD`'s ref.
+func worktreeBase(ctx context.Context, worktree string) (string, error) {
+	out, err := exec.CommandContext(ctx, "git", "-C", worktree, "config", "--local", "gleaner.base").Output()
+	if err == nil {
+		s := strings.TrimSpace(string(out))
+		if s != "" {
+			return s, nil
+		}
+	}
+	// Fallback: symbolic-ref of origin/HEAD.
+	out, err = exec.CommandContext(ctx, "git", "-C", worktree,
+		"symbolic-ref", "--short", "refs/remotes/origin/HEAD").Output()
+	if err != nil {
+		return "main", nil
+	}
+	ref := strings.TrimSpace(string(out))
+	if i := strings.Index(ref, "/"); i >= 0 {
+		return ref[i+1:], nil
+	}
+	return ref, nil
 }
 
 func buildPRBody(iss *github.Issue, prof *config.Profile, res *executor.Result) string {

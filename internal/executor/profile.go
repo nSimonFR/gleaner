@@ -188,6 +188,9 @@ func setupWorkTree(ctx context.Context, repo string, issueNum int, title, root s
 	if err := cmd.Run(); err != nil {
 		return "", "", fmt.Errorf("worktree add: %w (%s)", err, stderr.String())
 	}
+	// Stamp the base branch into the worktree's local git config so the
+	// PR opener picks it up without having to re-derive defaultBranch.
+	_ = exec.CommandContext(ctx, "git", "-C", wt, "config", "--local", "gleaner.base", base).Run()
 	return wt, branch, nil
 }
 
