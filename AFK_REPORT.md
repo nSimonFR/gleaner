@@ -151,9 +151,53 @@ they're the API surfaces the next phase wires.
    label one test issue with `afk-ready` + `complexity:routine`, wait
    for the next tick or `sudo systemctl start gleaner.service`.
 
+## Second review pass (after first AFK_REPORT was written)
+
+A second subagent reviewer caught four issues the first pass missed.
+All fixed in commit `671a261`:
+
+1. **PR base hardcoded to `"main"`** at `drain.go:121` — the first
+   fix only updated `setupWorkTree`, leaving `gh pr create --base main`
+   broken for repos using `master`/`develop`. Now stamps
+   `git config --local gleaner.base <default-branch>` in the worktree
+   and reads it back at PR time.
+2. **`pickIssue` ignored complexity:* gating** — the plan v0.0.2 §3
+   says "missing complexity:* → skip, log, don't default", but with a
+   `match: "*"` profile in the config every `afk-ready` issue got
+   dispatched to the default. Now filters explicitly and logs
+   `skip-issue: ... reason=missing_complexity_label`.
+3. **`mergeOverlay` zero-value collapse** — `inflight_prs: 0` was
+   being silently ignored because the merger used `!= 0` tests.
+   Rewrote as pointer-bearing `configOverlay` + `applyTo`; verified
+   that `inflight_prs: 0` now denies with
+   `skip: inflight_cap_hit (0/0 open PRs)`.
+4. **`gleaner.config.yaml` repos all 404** — used `nSimonFR-ai/<repo>`
+   (bot account) but the repos live under `nSimonFR/` (personal).
+   Without this fix, every timer tick would log
+   `pick: gh issue list: GraphQL: Could not resolve to a Repository`
+   forever, no dispatch ever. Fixed; `pi-mobile` also dropped from
+   the list because `$HOME/pi-mobile` isn't cloned (gleaner's worktree
+   creator needs the local clone).
+
+Re-verified after the fixes:
+- `nix build` of gleaner: green
+- `sudo nixos-rebuild build --flake .#rpi5`: green
+- `gleaner snapshot` still works
+- `inflight_prs: 0` override actually denies
+
+The reviewer also explicitly noted that *my first AFK_REPORT's claim
+"Claude % matches /api/oauth/usage exactly" was tautological* — the
+adapter just relays the endpoint, so it can't disagree by construction.
+Honest read: claim #2 in the verification table is a no-op assertion,
+not a verification. I should have written "Claude % is what
+/api/oauth/usage returns; we don't compute it locally so divergence is
+impossible".
+
 ## Where to look if something looks wrong
 
 - The plan file: `/home/nsimon/.claude/plans/rustling-chasing-engelbart.md`
 - This conversation's session log: `~/.claude/projects/-home-nsimon-nic-os--claude-worktrees-bridge-cse-01NLEFhNYDxcyxBzhJz5JdxN/`
-- The reviewer's actual critique: in this conversation, before the
-  `86a5ab3` fix commit. Search for "**Top 3 risks**".
+- The reviewers' actual critiques: in this conversation. The first
+  reviewer's findings preceded commit `86a5ab3`; the second
+  reviewer's findings preceded `671a261`. Search for "**Top 3 risks**"
+  to find them.
