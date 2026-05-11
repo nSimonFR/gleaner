@@ -17,31 +17,27 @@ blocking your live work and without drowning you in PRs to review on Monday.
 ## Status
 
 **v0.0.3** — four subcommands ship; the daemon is deployed on the author's
-rpi5 as `services.gleaner`. A reviewer pass closed twelve issues on top of
-the initial v0.0.3 work.
+rpi5 as `services.gleaner`.
 
-- `gleaner snapshot` — read both providers' quota at zero token cost.
+- `gleaner snapshot` — print both providers' quota at zero token cost.
 - `gleaner drain --config <yaml>` — single-shot dispatch (predicate →
-  one issue → one PR labeled `afk` + `needs-review` with a metadata block).
+  one issue → one PR labeled `afk` + `needs-review`).
 - `gleaner serve --config <yaml>` — long-running daemon for non-systemd
-  setups. The shipped NixOS module uses the simpler timer-fires-drain
-  pattern instead; `serve` is for testing or other init systems.
+  setups. The NixOS module uses timer-fires-drain instead; `serve` is
+  for testing or other init systems.
 - `gleaner bootstrap --config <yaml>` — idempotent label creation
-  across configured repos (`afk-ready`, `complexity:{trivial,routine,hard}`,
-  `needs-human`, `blocked`, `wip`, `afk`, `needs-review`).
-- NixOS module: `services.gleaner.{enable, user, configFile, ...}`.
+  (`afk-ready`, `complexity:{trivial,routine,hard}`, `needs-human`,
+  `blocked`, `wip`, `afk`, `needs-review`).
 
-Next: HTTP `/status` for a homepage widget (v0.0.4); worked example of
-the Codex executor profile (v0.0.5; the executor mechanism already
-supports it via `run: ["codex", "exec", "{prompt}"]`). Everything
-deliberately deferred past v0.0.5 lives in [IDEAS.md](./IDEAS.md).
+Next: HTTP `/status` for a homepage widget (v0.0.4); a worked Codex
+executor profile (v0.0.5; the executor already supports it). Everything
+deferred past v0.0.5 lives in [IDEAS.md](./IDEAS.md).
 
 ## The design claim
 
 Both Claude Code and Codex CLI already expose usable utilization at zero
 token cost. Gleaner's load-bearing innovation is **reading the journals
-the CLIs already write**, never invoking them as subprocesses to ask
-"how much quota do I have left?".
+the CLIs already write**, never invoking them as subprocesses.
 
 | Provider | Source                                            | Cost     | Notes                                                            |
 |----------|---------------------------------------------------|----------|------------------------------------------------------------------|
@@ -54,18 +50,14 @@ was v0.0.1's acceptance test for the multi-provider premise. It did.
 ## Quickstart
 
 ```
-nix build
-./result/bin/gleaner snapshot
+nix build && ./result/bin/gleaner snapshot
 ```
 
-Or with a Go toolchain (1.25+):
+or with a Go 1.25+ toolchain:
 
 ```
-go build -o gleaner ./cmd/gleaner
-./gleaner snapshot
+go build -o gleaner ./cmd/gleaner && ./gleaner snapshot
 ```
-
-Example output:
 
 ```
 $ gleaner snapshot
@@ -79,8 +71,7 @@ codex (plus)   [source: rollout-2026-05-10T14-34-49-019e11e2.jsonl]:
   long     0.0%   resets in 6d 18h
 ```
 
-`snapshot` requires no config. `drain`, `serve`, and `bootstrap` all
-take `--config <yaml>`.
+`snapshot` needs no config. `drain`, `serve`, `bootstrap` take `--config <yaml>`.
 
 ## Config
 
@@ -151,124 +142,35 @@ identical evaluation, longer-lived process. Layout:
 
 ## Setup for AI coding agents
 
-You will land in this repo cold. Read this before doing anything.
-
-### Toolchain, dev shell, build
-
-- **Go 1.25.8** (`go.mod`). Single direct dep: `gopkg.in/yaml.v3`,
-  vendored under `vendor/` (`vendorHash = null` in `flake.nix`). Run
-  `go mod vendor` after any dependency change.
-- `nix develop` provides `go`, `gopls`, `golangci-lint`. The flake
-  also exposes `packages.default` and `nixosModules.gleaner`.
-- Build with `nix build` (produces `./result/bin/gleaner`) or
-  `go build -o gleaner ./cmd/gleaner`.
-
-### Tests
-
-**None yet.** Reserved for v0.1 — integration tests using `gh`-stub
-binaries and a fake credentials file will land under `internal/*/_test.go`.
-Don't add tests opportunistically; the discipline is "tests when the
-failure mode they prevent has been seen once".
-
-### Smoke-test against a safe config
-
-`gleaner.test.yaml` shape (point at a throwaway repo, never burn quota):
-
-```yaml
-account: nSimonFR-ai
-repos:    [nSimonFR/gleaner-test]
-profiles: [{ match: "*", run: ["sh", "-c", "echo dry-run: $GLEANER_PROMPT >&2"], on_success: none }]
-hours:    { drain: "00:00-24:00", poll: 1m }
-guards:   { inflight_prs: 99 }
-```
-
-```
-./result/bin/gleaner drain --config /tmp/gleaner.test.yaml --dry-run
-./result/bin/gleaner drain --config /tmp/gleaner.test.yaml --worktree-root /tmp/gleaner-wt
-```
-
-`--dry-run` evaluates the predicate and exits; the second invocation
-runs the executor but `on_success: none` means no PR opens.
-
-### Vetting before commit
-
-```
-go vet ./...
-go build ./...
-```
-
-`golangci-lint run` is available in the dev shell but not yet wired
-to a hook.
-
-### Hard rules
-
-- **Never invoke `claude` or `codex` as subprocesses to read quota.**
-  Zero-cost reads from local journals are the load-bearing innovation.
-  An adapter that shells out to a CLI defeats the whole project.
-- **`gh auth switch -u nSimonFR-ai` before any GitHub op.** The
-  `internal/adapter/github` client enforces this via `EnforceAuth` —
-  every `drain` and `bootstrap` invocation asserts the active user
-  matches `cfg.Account` and refuses otherwise. Don't disable this
-  check.
-- **No `state.json`, no SQLite, no embedded KV.** Gleaner is stateless
-  by design: inflight count comes from `gh pr list --label afk --state open`,
-  daily count from `gh pr list --search created:>=<today>`, merge count
-  from `gh pr list --state merged --search merged:>=<7d>`. GitHub is the
-  source of truth. If you find yourself reaching for persistent state,
-  you're solving the wrong problem — the loop is already idempotent.
-- **`IDEAS.md` is one-way.** Anything past v0.0.5 must be promoted out
-  of `IDEAS.md` by articulating which existing failure mode the idea
-  addresses, not added directly to v0.0.x. Speculative features rot
-  under `IDEAS.md` until reality justifies them.
-
-### Adding a new executor profile
-
-Config-only — no Go code. Append to the user's `profiles:` list:
-
-```yaml
-- { match: "review",
-    run:   ["npx", "opencastle", "run", "review.convoy.yml"],
-    name:  opencastle-review,
-    on_success: comment }
-```
-
-If `name` is omitted, it's derived from `run[0]` (or
-`opencastle-<convoy>` for `npx opencastle run X.convoy.yml`). If
-`plan` is omitted, it's inferred from `run[0]` (`claude`,
-`codex`). See `internal/config/config.go: deriveProfileName`,
-`derivePlanFromRun`.
-
-### Adding a new provider adapter
-
-1. Implement `QuotaSource` (`internal/adapter/quota.go`) in
-   `internal/adapter/<name>/`. The interface is two methods:
-   `Snapshot(ctx) (*UsageSnapshot, error)` and `Provider() string`.
-2. Register the adapter in both `cmd/gleaner/snapshot.go` and
-   `cmd/gleaner/drain.go` — each builds a `[]adapter.QuotaSource`
-   slice for the predicate and snapshot pipelines. (`serve.go`
-   builds the same slice; update it too.)
-3. Cost gate: if your adapter needs to invoke the provider's CLI or
-   spend tokens to read utilization, the design is wrong. Find the
-   on-disk artifact the CLI already writes.
-
-### Commit messages
-
-Look at `git log --oneline` and mimic the pattern. v0.0.x commits use:
-
-- `vX.Y.Z: <short description>` for version-shipping commits
-- `fix: <what>` for bug fixes
-- `docs: <what>` for README / IDEAS / report updates
-
-No conventional-commit scopes, no trailers. Subagent-reviewed commits
-are folded into a single `fix:` rather than per-issue commits.
-
----
-
+> Install gleaner on a NixOS host:
+>
+> 1. Add to flake inputs: `gleaner.url = "github:nSimonFR/gleaner";`
+> 2. Import the module: `inputs.gleaner.nixosModules.gleaner` in your rpi5/host modules list (or `imports = [ inputs.gleaner.nixosModules.gleaner ];` in a per-service file).
+> 3. Configure:
+>    ```nix
+>    services.gleaner = {
+>      enable     = true;
+>      user       = "<your-real-user>";   # must own ~/.claude/projects and ~/.codex/sessions
+>      configFile = ./gleaner.config.yaml;
+>    };
+>    ```
+>    Minimal `gleaner.config.yaml`:
+>    ```yaml
+>    account: <your-gh-bot-account>
+>    repos:   [<owner>/<repo>, ...]
+>    profiles:
+>      - { match: "*", run: ["claude", "-p", "{prompt}"] }
+>    ```
+> 4. `sudo nixos-rebuild switch --flake .#<host>`
+> 5. One-time: `gleaner bootstrap --config <path-to-config>` to create the 9 required labels (`afk-ready`, `complexity:{trivial,routine,hard}`, `needs-human`, `blocked`, `wip`, `afk`, `needs-review`).
+> 6. Label a test issue with `afk-ready` + `complexity:routine`. The timer dispatches on the next tick (default 10 min, drain hours 22:00–07:00).
+>
+> The service is stateless: GitHub is the source of truth for inflight count, history, daily count. There is no `state.json`. If you ever feel tempted to add one, read `internal/predicate/eval.go` first — every guard query goes through `gh`.
 ## NixOS module
 
 ```nix
 {
-  inputs.gleaner.url = "github:nSimonFR/gleaner";
+  inputs.gleaner.url = "github:nSimonFR-ai/gleaner";
 
   outputs = { self, nixpkgs, gleaner, ... }: {
     nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
@@ -290,15 +192,12 @@ are folded into a single `fix:` rather than per-issue commits.
 }
 ```
 
-The module ships `gleaner.service` (Type=oneshot, runs
-`gleaner drain --config <configFile>`) plus `gleaner.timer`
-(`OnUnitActiveSec=10min`, `Persistent=true`). `ProtectHome` is
-disabled because gleaner must read the operator user's
-`~/.claude/.credentials.json` and `~/.codex/sessions/`.
-
-The configured `user` is intentionally a real human user, not a
-synthetic service account — gleaner reads *that user's* quota
-journals, and a synthetic user has none.
+The module ships `gleaner.service` (Type=oneshot, runs `gleaner drain
+--config <configFile>`) plus `gleaner.timer` (`Persistent=true`).
+`ProtectHome` is off because gleaner must read the operator user's
+`~/.claude/.credentials.json` and `~/.codex/sessions/`. The configured
+`user` is intentionally a real human user — gleaner reads *that user's*
+quota journals.
 
 ---
 
@@ -306,7 +205,7 @@ journals, and a synthetic user has none.
 
 - [IDEAS.md](./IDEAS.md) — explicitly deferred past v0.0.5: extra
   executor profiles, hook recipes, auto-merge, quota optimization,
-  observability extensions, routing, storage.
+  observability extensions, routing.
 
 ## License
 
