@@ -36,6 +36,12 @@ type Orchestrator struct {
 	WorkTreeRoot string
 	State        *State
 
+	// Refresh is an optional buffered channel the HTTP server posts to
+	// via POST /api/v1/refresh. The Run loop selects on it alongside
+	// the ticker; a non-blocking send + select-default coalesces
+	// bursts. Caller constructs and shares the channel with the server.
+	Refresh chan struct{}
+
 	// HookFire is the legacy event hook ("pr_opened", "dispatch_failed", …).
 	// The orchestrator's PROpener (Milestone E) will invoke it.
 	HookFire func(event string, payload map[string]any)
@@ -412,6 +418,11 @@ func (o *Orchestrator) Run(ctx context.Context) {
 			return
 		case t := <-tick.C:
 			o.Tick(ctx, t)
+		case <-o.Refresh:
+			// SPEC §13.7 POST /api/v1/refresh — operator (or homepage
+			// widget) asked us to poll now without waiting for the
+			// next ticker.
+			o.Tick(ctx, time.Now())
 		}
 	}
 }

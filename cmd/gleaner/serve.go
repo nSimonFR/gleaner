@@ -14,12 +14,14 @@ import (
 	"github.com/nSimonFR/gleaner/internal/config"
 	"github.com/nSimonFR/gleaner/internal/executor"
 	"github.com/nSimonFR/gleaner/internal/orchestrator"
+	"github.com/nSimonFR/gleaner/internal/server"
 )
 
 func serveCmd(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "path to YAML config (required)")
 	workTreeRoot := fs.String("worktree-root", "/tmp/gleaner-worktrees", "where to create per-task worktrees")
+	portOverride := fs.Int("port", 0, "HTTP server port; overrides config.server.port; 0 disables")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -32,6 +34,9 @@ func serveCmd(ctx context.Context, args []string) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "config:", err)
 		return 1
+	}
+	if *portOverride > 0 {
+		cfg.Server.Port = *portOverride
 	}
 
 	trk, err := buildTracker(cfg)
@@ -55,6 +60,8 @@ func serveCmd(ctx context.Context, args []string) int {
 	orchestrator.CleanupTerminalWorkspaces(ctx, trk, *workTreeRoot, cfg.Tracker.TerminalStates)
 
 	state := orchestrator.NewState()
+	refresh := make(chan struct{}, 1)
+
 	orch := &orchestrator.Orchestrator{
 		Cfg:           cfg,
 		Tracker:       trk,
@@ -63,9 +70,34 @@ func serveCmd(ctx context.Context, args []string) int {
 		QuotaSources:  quotaSources,
 		WorkTreeRoot:  *workTreeRoot,
 		State:         state,
+		Refresh:       refresh,
 		HookFire:      func(event string, payload map[string]any) { fireHook(cfg.Hook, event, payload) },
 		PROpener:      makePROpener(trk, ch),
 	}
+
+	// Start the HTTP server if cfg.Server.Port > 0. Runs in its own
+	// goroutine; the orchestrator drives the tick loop on this one.
+	srv := &server.Server{
+		Cfg:           cfg,
+		Tracker:       trk,
+		CodeHost:      ch,
+		CodehostRepos: chRepos,
+		QuotaSources:  quotaSources,
+		State:         state,
+		Refresh:       refresh,
+	}
+	httpSrv, err := srv.Start(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "server:", err)
+		return 1
+	}
+	defer func() {
+		if httpSrv != nil {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*1e9)
+			defer cancel()
+			_ = httpSrv.Shutdown(shutdownCtx)
+		}
+	}()
 
 	orch.Run(ctx)
 	return 0

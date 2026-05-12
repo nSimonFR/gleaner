@@ -38,7 +38,15 @@ type Config struct {
 	Hooks       Hooks       `yaml:"hooks"`       // Milestone B lifecycle hooks (sync, gating)
 	Agent       Agent       `yaml:"agent"`       // Milestone C orchestrator settings (SPEC §5.3)
 	Concurrency Concurrency `yaml:"concurrency"` // Milestone C per-provider sub-caps
+	Server      Server      `yaml:"server"`      // Milestone E HTTP API + dashboard (SPEC §13.7)
 	Safety      Safety      `yaml:"safety"`
+}
+
+// Server mirrors SPEC §13.7 `server` block. When Port > 0, gleaner
+// binds 127.0.0.1:<Port> and serves /api/v1/* + the / dashboard.
+// 0 (or unset) disables — gleaner stays headless.
+type Server struct {
+	Port int `yaml:"port"`
 }
 
 // Agent mirrors SPEC §5.3 `agent.*`. Defaults come from SPEC verbatim
@@ -346,7 +354,12 @@ type configOverlay struct {
 	Hooks       *hooksOverlay       `yaml:"hooks"`
 	Agent       *agentOverlay       `yaml:"agent"`
 	Concurrency *concurrencyOverlay `yaml:"concurrency"`
+	Server      *serverOverlay      `yaml:"server"`
 	Safety      *safetyOverlay      `yaml:"safety"`
+}
+
+type serverOverlay struct {
+	Port *int `yaml:"port"`
 }
 
 type agentOverlay struct {
@@ -491,6 +504,9 @@ func (ov *configOverlay) applyTo(base *Config) {
 	}
 	if ov.Concurrency != nil && ov.Concurrency.PerProvider != nil {
 		base.Concurrency.PerProvider = *ov.Concurrency.PerProvider
+	}
+	if ov.Server != nil && ov.Server.Port != nil {
+		base.Server.Port = *ov.Server.Port
 	}
 	if ov.Safety != nil {
 		if ov.Safety.MaxPerDay != nil {
