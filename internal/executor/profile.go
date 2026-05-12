@@ -51,7 +51,7 @@ type Result struct {
 	DurationMs int64
 	Stdout     string
 	Stderr     string
-	HasChanges bool // worktree had `git status --porcelain` non-empty
+	HasChanges bool // worktree dirty OR HEAD ahead of gleaner.base (see detectWorktreeChanges)
 	HeadSHA    string
 	Error      error
 }
@@ -257,14 +257,16 @@ func runInWorkspace(ctx context.Context, prof *config.Profile, iss *tracker.Issu
 	}
 	result.ExitCode = 0
 
-	// 5. Inspect worktree changes — `status --porcelain` catches BOTH
-	// modifications to tracked files AND new untracked files. A bare
-	// `git diff --quiet` would miss new-file dispatches entirely.
+	// 5. Inspect worktree changes — flagged if EITHER:
+	//   (a) the working tree is dirty (uncommitted), OR
+	//   (b) HEAD has advanced past the gleaner.base ref (committed by the agent).
+	// Profiles that commit (e.g. `claude` running with permissive
+	// shell tools) leave a clean status but a non-zero commit count;
+	// profiles that just write files leave a dirty status with no
+	// commits. Both must be detected — checking only (a) silently
+	// dropped real PRs.
 	// (No-op for tests that drive runInWorkspace against a plain dir.)
-	statusCmd := exec.CommandContext(ctx, "git", "-C", wt, "status", "--porcelain")
-	if out, err := statusCmd.Output(); err == nil && len(strings.TrimSpace(string(out))) > 0 {
-		result.HasChanges = true
-	}
+	result.HasChanges = detectWorktreeChanges(ctx, wt)
 	headCmd := exec.CommandContext(ctx, "git", "rev-parse", "HEAD")
 	headCmd.Dir = wt
 	if h, err := headCmd.Output(); err == nil {
@@ -272,6 +274,39 @@ func runInWorkspace(ctx context.Context, prof *config.Profile, iss *tracker.Issu
 	}
 
 	return result, nil
+}
+
+// detectWorktreeChanges returns true if the worktree has either
+// uncommitted changes OR commits ahead of its gleaner.base ref. Returns
+// false when neither signal applies, or when the git invocations fail
+// (a non-git directory yields false — preserves test-mode behavior).
+func detectWorktreeChanges(ctx context.Context, wt string) bool {
+	// (a) Dirty working tree — `status --porcelain` catches both modified
+	// tracked files and new untracked files.
+	statusCmd := exec.CommandContext(ctx, "git", "-C", wt, "status", "--porcelain")
+	if out, err := statusCmd.Output(); err == nil && len(strings.TrimSpace(string(out))) > 0 {
+		return true
+	}
+	// (b) Committed work — count commits between the base ref (stamped
+	// by setupWorkTree via `git config --local gleaner.base <base>`) and
+	// HEAD. A bare profile that doesn't commit returns 0 here.
+	baseCmd := exec.CommandContext(ctx, "git", "-C", wt, "config", "--local", "gleaner.base")
+	baseOut, err := baseCmd.Output()
+	if err != nil {
+		return false
+	}
+	base := strings.TrimSpace(string(baseOut))
+	if base == "" {
+		return false
+	}
+	revCmd := exec.CommandContext(ctx, "git", "-C", wt, "rev-list", "--count",
+		fmt.Sprintf("origin/%s..HEAD", base))
+	revOut, err := revCmd.Output()
+	if err != nil {
+		return false
+	}
+	count := strings.TrimSpace(string(revOut))
+	return count != "" && count != "0"
 }
 
 // hookEnv returns the GLEANER_* env list every lifecycle hook receives.
