@@ -74,7 +74,7 @@ func TestRunInWorkspace_HappyPath(t *testing.T) {
 		Cwd:     wt,
 		Timeout: 5 * time.Second,
 	}
-	res, err := runInWorkspace(context.Background(), prof, testIssue(), wt, true, hooks, &Result{})
+	res, err := runInWorkspace(context.Background(), prof, testIssue(), wt, true, RunOpts{Hooks: hooks}, &Result{})
 	if err != nil {
 		t.Fatalf("runInWorkspace: %v", err)
 	}
@@ -118,7 +118,7 @@ func TestRunInWorkspace_AfterCreateFatal(t *testing.T) {
 		Cwd:     wt,
 		Timeout: 5 * time.Second,
 	}
-	res, err := runInWorkspace(context.Background(), prof, testIssue(), wt, false, hooks, &Result{})
+	res, err := runInWorkspace(context.Background(), prof, testIssue(), wt, false, RunOpts{Hooks: hooks}, &Result{})
 	if !errors.Is(err, ErrAfterCreateFailed) {
 		t.Fatalf("err = %v; want ErrAfterCreateFailed", err)
 	}
@@ -168,7 +168,7 @@ func TestRunInWorkspace_BeforeRunDenial(t *testing.T) {
 		Cwd:     wt,
 		Timeout: 5 * time.Second,
 	}
-	_, err := runInWorkspace(context.Background(), prof, testIssue(), wt, true, hooks, &Result{})
+	_, err := runInWorkspace(context.Background(), prof, testIssue(), wt, true, RunOpts{Hooks: hooks}, &Result{})
 	if !errors.Is(err, ErrBeforeRunDenied) {
 		t.Fatalf("err = %v; want ErrBeforeRunDenied", err)
 	}
@@ -205,7 +205,7 @@ func TestRunInWorkspace_AgentFailsAfterRunStillFires(t *testing.T) {
 		Cwd:     wt,
 		Timeout: 5 * time.Second,
 	}
-	res, err := runInWorkspace(context.Background(), prof, testIssue(), wt, false, hooks, &Result{})
+	res, err := runInWorkspace(context.Background(), prof, testIssue(), wt, false, RunOpts{Hooks: hooks}, &Result{})
 	if err == nil {
 		t.Fatal("expected agent exit-1 error")
 	}
@@ -238,7 +238,7 @@ func TestRunInWorkspace_NoHooks(t *testing.T) {
 		Cwd:     wt,
 		Timeout: 5 * time.Second,
 	}
-	res, err := runInWorkspace(context.Background(), prof, testIssue(), wt, false, config.Hooks{}, &Result{})
+	res, err := runInWorkspace(context.Background(), prof, testIssue(), wt, false, RunOpts{}, &Result{})
 	if err != nil {
 		t.Fatalf("runInWorkspace with empty hooks: %v", err)
 	}
@@ -276,7 +276,7 @@ func TestRunInWorkspace_OrderOfFire(t *testing.T) {
 		Cwd:     wt,
 		Timeout: 5 * time.Second,
 	}
-	if _, err := runInWorkspace(context.Background(), prof, testIssue(), wt, true, hooks, &Result{}); err != nil {
+	if _, err := runInWorkspace(context.Background(), prof, testIssue(), wt, true, RunOpts{Hooks: hooks}, &Result{}); err != nil {
 		t.Fatalf("runInWorkspace: %v", err)
 	}
 	data, err := os.ReadFile(log)
