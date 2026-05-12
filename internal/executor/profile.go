@@ -59,12 +59,14 @@ type Result struct {
 // worktree cleanup decision (passed via cleanup bool).
 //
 // `hooks` carries the 4 lifecycle scripts and timeout from cfg.Hooks.
-// Nil is acceptable — passing a zero Hooks{} skips them all.
+// A zero Hooks{} skips them all.
+//
+// Run is a thin wrapper around setupWorkTree + runInWorkspace. The split
+// lets tests drive the hook + agent path without needing a real git
+// source repo on disk.
 func Run(ctx context.Context, prof *config.Profile, iss *tracker.Issue, workTreeRoot string, cleanup bool, hooks config.Hooks) (*Result, error) {
-	start := time.Now()
 	result := &Result{Profile: prof.Name}
 
-	// 1. Clone fresh worktree.
 	// `issueKey` is the human-meaningful portion used in worktree path and
 	// branch name. For GitHub: the issue number ("60"). For Linear: the
 	// identifier ("MT-649"). Linear issues have Number==0 so we fall back
@@ -82,15 +84,52 @@ func Run(ctx context.Context, prof *config.Profile, iss *tracker.Issue, workTree
 	}
 	result.WorkTree = wt
 	result.Branch = branch
+	return runInWorkspace(ctx, prof, iss, wt, cleanup, hooks, result)
+}
+
+// runInWorkspace fires the 4 lifecycle hooks around the agent exec.
+// Extracted from Run so tests can drive it with a t.TempDir() workspace
+// — git-free. Caller has already populated result.WorkTree / .Branch.
+func runInWorkspace(ctx context.Context, prof *config.Profile, iss *tracker.Issue, wt string, cleanup bool, hooks config.Hooks, result *Result) (*Result, error) {
+	start := time.Now()
+	env := hookEnv(iss, wt)
+
 	// cleanup=true means delete workspace at end. We honor that via a
-	// before_remove hook + RemoveAll (see hookEnv below for env passing).
+	// before_remove hook + RemoveAll. The deferred cleanup includes the
+	// after_create failure path: if after_create fails, we MUST still
+	// give before_remove a chance to inspect the partial workspace
+	// (Elixir Symphony's Workspace.remove always fires before_remove
+	// before deletion — gleaner matches).
+	var afterCreateFailed bool
 	defer func() {
-		if cleanup {
-			runBeforeRemoveAndDelete(ctx, hooks, wt, hookEnv(iss, wt))
+		// Fire before_remove + cleanup whenever cleanup is requested,
+		// OR whenever after_create failed (so the operator's
+		// before_remove still observes the partial state if they wired
+		// one). Otherwise leave the workspace for the caller to keep.
+		if cleanup || afterCreateFailed {
+			runBeforeRemoveAndDelete(ctx, hooks, wt, env)
 		}
 	}()
 
-	// 2. Render template vars in profile.Run.
+	// 1. after_create — runs after the worktree exists. The executor
+	// always creates a fresh worktree per Run (no reuse), so this is
+	// equivalent to "after worktree exists". Workspace reuse across
+	// retries (Milestone C) will refine this to gate on first-creation.
+	// SPEC §9.4: failure is fatal.
+	if err := hook.RunLifecycle(ctx, "after_create", hooks.AfterCreate, wt, env, hooks.Timeout); err != nil {
+		afterCreateFailed = true
+		result.Error = err
+		return result, fmt.Errorf("%w: %v", ErrAfterCreateFailed, err)
+	}
+
+	// 2. before_run — gating hook. Non-zero exit aborts the dispatch
+	// attempt (not a failure — see ErrBeforeRunDenied doc).
+	if err := hook.RunLifecycle(ctx, "before_run", hooks.BeforeRun, wt, env, hooks.Timeout); err != nil {
+		result.Error = err
+		return result, fmt.Errorf("%w: %v", ErrBeforeRunDenied, err)
+	}
+
+	// 3. Render template vars + exec the agent command.
 	vars := map[string]string{
 		"prompt":           buildPrompt(iss),
 		"worktree":         wt,
@@ -102,27 +141,7 @@ func Run(ctx context.Context, prof *config.Profile, iss *tracker.Issue, workTree
 	}
 	rendered := renderArgs(prof.Run, vars)
 	renderedCwd := renderString(prof.Cwd, vars)
-	env := hookEnv(iss, wt)
 
-	// 3. after_create — fires only on first workspace creation. The current
-	// executor always creates a fresh worktree per Run (no reuse), so this
-	// is equivalent to "after worktree exists". Workspace reuse across
-	// retries (Milestone C) will refine this to gate on first-creation.
-	// SPEC §9.4: failure is fatal — tear the workspace down before returning.
-	if err := hook.RunLifecycle(ctx, "after_create", hooks.AfterCreate, wt, env, hooks.Timeout); err != nil {
-		_ = os.RemoveAll(wt)
-		result.Error = err
-		return result, fmt.Errorf("%w: %v", ErrAfterCreateFailed, err)
-	}
-
-	// 4. before_run — gating hook. Non-zero exit aborts the dispatch attempt
-	// (not a failure — see ErrBeforeRunDenied doc).
-	if err := hook.RunLifecycle(ctx, "before_run", hooks.BeforeRun, wt, env, hooks.Timeout); err != nil {
-		result.Error = err
-		return result, fmt.Errorf("%w: %v", ErrBeforeRunDenied, err)
-	}
-
-	// 5. Exec the command.
 	timeout := prof.Timeout
 	if timeout == 0 {
 		timeout = 30 * time.Minute
@@ -132,7 +151,6 @@ func Run(ctx context.Context, prof *config.Profile, iss *tracker.Issue, workTree
 
 	cmd := exec.CommandContext(cctx, rendered[0], rendered[1:]...)
 	cmd.Dir = renderedCwd
-	// Prefix with GLEANER_ to avoid clobbering common env names like PROMPT.
 	cmd.Env = append(os.Environ(), env...)
 	cmd.Env = append(cmd.Env, "GLEANER_PROMPT="+vars["prompt"])
 	var stdout, stderr bytes.Buffer
@@ -143,26 +161,33 @@ func Run(ctx context.Context, prof *config.Profile, iss *tracker.Issue, workTree
 	result.Stderr = stderr.String()
 	result.DurationMs = time.Since(start).Milliseconds()
 
-	// 6. after_run — always fires, even on dispatch failure. Best-effort
-	// per SPEC §9.4 (failure logged, ignored).
-	if err := hook.RunLifecycle(ctx, "after_run", hooks.AfterRun, wt, env, hooks.Timeout); err != nil {
+	// 4. after_run — always fires, even on dispatch failure. Best-effort
+	// per SPEC §9.4 (failure logged, ignored). Carries an extra
+	// GLEANER_EXIT_CODE env so post-mortem hooks know the outcome.
+	exitCode := 0
+	if runErr != nil {
+		if ee, ok := runErr.(*exec.ExitError); ok {
+			exitCode = ee.ExitCode()
+		} else {
+			exitCode = -1
+		}
+	}
+	afterRunEnv := append([]string{fmt.Sprintf("GLEANER_EXIT_CODE=%d", exitCode)}, env...)
+	if err := hook.RunLifecycle(ctx, "after_run", hooks.AfterRun, wt, afterRunEnv, hooks.Timeout); err != nil {
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 	}
 
 	if runErr != nil {
-		if ee, ok := runErr.(*exec.ExitError); ok {
-			result.ExitCode = ee.ExitCode()
-		} else {
-			result.ExitCode = -1
-		}
+		result.ExitCode = exitCode
 		result.Error = runErr
 		return result, runErr
 	}
 	result.ExitCode = 0
 
-	// 7. Inspect worktree changes — `status --porcelain` catches BOTH
+	// 5. Inspect worktree changes — `status --porcelain` catches BOTH
 	// modifications to tracked files AND new untracked files. A bare
 	// `git diff --quiet` would miss new-file dispatches entirely.
+	// (No-op for tests that drive runInWorkspace against a plain dir.)
 	statusCmd := exec.CommandContext(ctx, "git", "-C", wt, "status", "--porcelain")
 	if out, err := statusCmd.Output(); err == nil && len(strings.TrimSpace(string(out))) > 0 {
 		result.HasChanges = true
