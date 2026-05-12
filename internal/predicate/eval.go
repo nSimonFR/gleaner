@@ -4,6 +4,11 @@
 //
 // Result is Decision{Allow, Reason} — never a bare bool, so the operator
 // can always see *why* a dispatch was skipped.
+//
+// Milestone A: the inflight/daily counters are codehost concerns (PRs live
+// on GitHub regardless of which tracker drives issues), so this package
+// takes a *codehost.Client and a repos slice rather than the old
+// `*github.Client` direct dependency.
 package predicate
 
 import (
@@ -13,7 +18,7 @@ import (
 	"time"
 
 	"github.com/nSimonFR/gleaner/internal/adapter"
-	"github.com/nSimonFR/gleaner/internal/adapter/github"
+	codehost "github.com/nSimonFR/gleaner/internal/adapter/codehost/github"
 	"github.com/nSimonFR/gleaner/internal/config"
 )
 
@@ -32,10 +37,11 @@ func allow() Decision {
 
 // Inputs bundles everything Evaluate needs.
 type Inputs struct {
-	Cfg          *config.Config
-	GH           *github.Client
-	QuotaSources []adapter.QuotaSource
-	Now          time.Time
+	Cfg           *config.Config
+	CodeHost      *codehost.Client // for inflight + daily counts
+	CodehostRepos []string         // repo(s) PRs count against
+	QuotaSources  []adapter.QuotaSource
+	Now           time.Time
 }
 
 // Evaluate runs all guards in order; returns the first that denies.
@@ -90,8 +96,8 @@ func Evaluate(ctx context.Context, in Inputs) Decision {
 	}
 
 	// 4. Inflight PR count.
-	if in.GH != nil && len(cfg.Repos) > 0 {
-		inflight, err := in.GH.CountOpenInflight(ctx, cfg.Repos)
+	if in.CodeHost != nil && len(in.CodehostRepos) > 0 {
+		inflight, err := in.CodeHost.CountOpenInflight(ctx, in.CodehostRepos)
 		if err != nil {
 			return deny("inflight_count_failed: %v", err)
 		}
@@ -101,7 +107,7 @@ func Evaluate(ctx context.Context, in Inputs) Decision {
 
 		// 5. Daily dispatch cap.
 		if cfg.Safety.MaxPerDay > 0 {
-			today, err := in.GH.CountDispatchedToday(ctx, cfg.Repos)
+			today, err := in.CodeHost.CountDispatchedToday(ctx, in.CodehostRepos)
 			if err != nil {
 				return deny("daily_count_failed: %v", err)
 			}
