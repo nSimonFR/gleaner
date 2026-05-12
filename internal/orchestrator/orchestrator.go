@@ -179,16 +179,6 @@ func (o *Orchestrator) dispatchEligible(ctx context.Context, candidates []tracke
 		}
 
 		// Profile match.
-		hasComplexity := false
-		for _, l := range iss.Labels {
-			if strings.HasPrefix(l, "complexity:") {
-				hasComplexity = true
-				break
-			}
-		}
-		if !hasComplexity {
-			continue
-		}
 		prof := o.Cfg.MatchProfile(iss.Labels)
 		if prof == nil {
 			continue

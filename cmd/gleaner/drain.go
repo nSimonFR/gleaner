@@ -171,20 +171,6 @@ func pickIssue(ctx context.Context, trk tracker.Tracker, cfg *config.Config) (*t
 	}
 	for i := range issues {
 		iss := issues[i]
-		hasComplexity := false
-		for _, l := range iss.Labels {
-			if strings.HasPrefix(l, "complexity:") {
-				hasComplexity = true
-				break
-			}
-		}
-		// Per the plan: missing complexity:* → skip, don't default-route.
-		// The wildcard match: "*" profile catches everything otherwise,
-		// which would route un-triaged issues to the default model.
-		if !hasComplexity {
-			fmt.Printf("skip-issue: %s reason=missing_complexity_label\n", iss.Identifier)
-			continue
-		}
 		profile := cfg.MatchProfile(iss.Labels)
 		if profile == nil {
 			fmt.Printf("skip-issue: %s reason=no_matching_profile labels=%v\n", iss.Identifier, iss.Labels)
