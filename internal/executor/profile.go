@@ -55,16 +55,21 @@ type Result struct {
 	Error      error
 }
 
+// RunOpts bundles the configuration the executor reads from cfg.Hooks
+// and cfg.Agent. Grouped here so call sites stay readable as more
+// agent-wide knobs land in later milestones (read_timeout, turn_timeout).
+type RunOpts struct {
+	Hooks        config.Hooks
+	StallTimeout time.Duration // SPEC §5.3.6 — 0 disables
+}
+
 // Run executes the profile against the given issue. The caller owns the
 // worktree cleanup decision (passed via cleanup bool).
-//
-// `hooks` carries the 4 lifecycle scripts and timeout from cfg.Hooks.
-// A zero Hooks{} skips them all.
 //
 // Run is a thin wrapper around setupWorkTree + runInWorkspace. The split
 // lets tests drive the hook + agent path without needing a real git
 // source repo on disk.
-func Run(ctx context.Context, prof *config.Profile, iss *tracker.Issue, workTreeRoot string, cleanup bool, hooks config.Hooks) (*Result, error) {
+func Run(ctx context.Context, prof *config.Profile, iss *tracker.Issue, workTreeRoot string, cleanup bool, opts RunOpts) (*Result, error) {
 	result := &Result{Profile: prof.Name}
 
 	// `issueKey` is the human-meaningful portion used in worktree path and
@@ -84,15 +89,16 @@ func Run(ctx context.Context, prof *config.Profile, iss *tracker.Issue, workTree
 	}
 	result.WorkTree = wt
 	result.Branch = branch
-	return runInWorkspace(ctx, prof, iss, wt, cleanup, hooks, result)
+	return runInWorkspace(ctx, prof, iss, wt, cleanup, opts, result)
 }
 
 // runInWorkspace fires the 4 lifecycle hooks around the agent exec.
 // Extracted from Run so tests can drive it with a t.TempDir() workspace
 // — git-free. Caller has already populated result.WorkTree / .Branch.
-func runInWorkspace(ctx context.Context, prof *config.Profile, iss *tracker.Issue, wt string, cleanup bool, hooks config.Hooks, result *Result) (*Result, error) {
+func runInWorkspace(ctx context.Context, prof *config.Profile, iss *tracker.Issue, wt string, cleanup bool, opts RunOpts, result *Result) (*Result, error) {
 	start := time.Now()
 	env := hookEnv(iss, wt)
+	hooks := opts.Hooks
 
 	// cleanup=true means delete workspace at end. We honor that via a
 	// before_remove hook + RemoveAll. The deferred cleanup includes the
@@ -153,13 +159,31 @@ func runInWorkspace(ctx context.Context, prof *config.Profile, iss *tracker.Issu
 	cmd.Dir = renderedCwd
 	cmd.Env = append(os.Environ(), env...)
 	cmd.Env = append(cmd.Env, "GLEANER_PROMPT="+vars["prompt"])
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	// SPEC §5.3.6 stall detection: a watcher polls the time of the most
+	// recent stdout/stderr Write and SIGKILLs the child if it goes
+	// silent past opts.StallTimeout. The watcher exits when its
+	// context cancels (deferred below).
+	sw := newStallWriter()
+	es := newStallWriter()
+	cmd.Stdout = sw
+	cmd.Stderr = es
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	stalled := watchStall(watchCtx, cmd, sw, opts.StallTimeout)
 	runErr := cmd.Run()
-	result.Stdout = stdout.String()
-	result.Stderr = stderr.String()
+	stopWatch()
+
+	result.Stdout = sw.String()
+	result.Stderr = es.String()
 	result.DurationMs = time.Since(start).Milliseconds()
+
+	// Distinguish a stall-induced kill from any other runErr. The watcher
+	// fires `stalled` (buffered) when it kills; we check non-blockingly.
+	stallFired := false
+	select {
+	case _, ok := <-stalled:
+		stallFired = ok
+	default:
+	}
 
 	// 4. after_run — always fires, even on dispatch failure. Best-effort
 	// per SPEC §9.4 (failure logged, ignored). Carries an extra
@@ -177,6 +201,11 @@ func runInWorkspace(ctx context.Context, prof *config.Profile, iss *tracker.Issu
 		fmt.Fprintf(os.Stderr, "%v\n", err)
 	}
 
+	if stallFired {
+		result.ExitCode = exitCode
+		result.Error = ErrStalled
+		return result, ErrStalled
+	}
 	if runErr != nil {
 		result.ExitCode = exitCode
 		result.Error = runErr

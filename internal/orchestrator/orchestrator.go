@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -15,8 +14,13 @@ import (
 	"github.com/nSimonFR/gleaner/internal/adapter/tracker"
 	"github.com/nSimonFR/gleaner/internal/config"
 	"github.com/nSimonFR/gleaner/internal/executor"
+	"github.com/nSimonFR/gleaner/internal/logging"
 	"github.com/nSimonFR/gleaner/internal/predicate"
 )
+
+// logF is a short alias for logging.F to keep orchestrator log lines
+// readable.
+var logF = logging.F
 
 // Orchestrator implements the SPEC §8.1 tick loop on top of a State
 // + a Tracker + a CodeHost + per-provider QuotaSources. It owns one
@@ -76,7 +80,7 @@ func (o *Orchestrator) Tick(ctx context.Context, now time.Time) {
 		Now:           now,
 	})
 	if !globalDecision.Allow {
-		fmt.Printf("[%s] skip: %s\n", now.Format(time.RFC3339), globalDecision.Reason)
+		logging.Log("tick_skip", logF("reason", globalDecision.Reason))
 		return
 	}
 	isActiveHour := predicate.IsActiveHour(now, o.Cfg.Hours)
@@ -84,7 +88,7 @@ func (o *Orchestrator) Tick(ctx context.Context, now time.Time) {
 	// SPEC §8.1 step 3: fetch candidates.
 	candidates, err := o.Tracker.ListActive(ctx)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "list_active_failed: %v\n", err)
+		logging.Log("list_active_failed", logF("err", err))
 		return
 	}
 
@@ -95,11 +99,42 @@ func (o *Orchestrator) Tick(ctx context.Context, now time.Time) {
 	o.dispatchEligible(ctx, candidates, now, isActiveHour)
 }
 
+// reconcileRunning implements SPEC §8.1 Part B: for each running
+// worker, fetch the tracker-current state. If the issue went terminal
+// externally (e.g. operator closed it on GitHub mid-run), cancel the
+// worker so we stop burning quota on a now-pointless dispatch.
+//
+// Fetch failures are logged and ignored — the worker keeps running;
+// we'll retry next tick. SPEC: "If fetch fails: keep workers running,
+// try again next tick".
 func (o *Orchestrator) reconcileRunning(ctx context.Context) error {
-	// Placeholder for Milestone D's terminal-state reconciliation.
-	// Today's Tick returns immediately; future work: fetch
-	// Tracker.GetState for each running issue; if terminal, Cancel
-	// the worker.
+	terminal := o.Cfg.Tracker.TerminalStates
+	if len(terminal) == 0 {
+		return nil
+	}
+	for _, w := range o.State.SnapshotRunning() {
+		state, err := o.Tracker.GetState(ctx, w.Issue.ID)
+		if err != nil {
+			logging.Log("reconcile_fetch_failed",
+				logF("issue_id", w.Issue.ID),
+				logF("issue_identifier", w.Issue.Identifier),
+				logF("session_id", w.Session.ID),
+				logF("err", err))
+			continue
+		}
+		if !tracker.IsTerminal(state, terminal) {
+			continue
+		}
+		logging.Log("reconcile_terminal",
+			logF("issue_id", w.Issue.ID),
+			logF("issue_identifier", w.Issue.Identifier),
+			logF("session_id", w.Session.ID),
+			logF("state", state))
+		if w.Cancel != nil {
+			w.Cancel()
+		}
+		o.State.Release(w.Issue.ID)
+	}
 	return nil
 }
 
@@ -129,7 +164,11 @@ func (o *Orchestrator) dispatchEligible(ctx context.Context, candidates []tracke
 		// ineligible. Tracker.ListActive already populates BlockedBy
 		// with the unresolved blocker IDs.
 		if len(iss.BlockedBy) > 0 {
-			fmt.Printf("skip-issue: %s reason=blocked_by=%v\n", iss.Identifier, iss.BlockedBy)
+			logging.Log("skip_issue",
+				logF("issue_id", iss.ID),
+				logF("issue_identifier", iss.Identifier),
+				logF("reason", "blocked_by"),
+				logF("blocked_by", fmt.Sprintf("%v", iss.BlockedBy)))
 			continue
 		}
 
@@ -212,31 +251,49 @@ func (o *Orchestrator) runWorker(ctx context.Context, w *Worker, attempt int) {
 	// restart semantics.
 	defer func() {
 		if r := recover(); r != nil {
-			fmt.Fprintf(os.Stderr, "worker_panic: issue=%s session=%s recover=%v\n",
-				w.Issue.Identifier, w.Session.ID, r)
+			logging.Log("worker_panic",
+				logF("issue_id", w.Issue.ID),
+				logF("issue_identifier", w.Issue.Identifier),
+				logF("session_id", w.Session.ID),
+				logF("recover", fmt.Sprintf("%v", r)))
 			o.State.Release(w.Issue.ID)
 		}
 	}()
 
 	taskID := fmt.Sprintf("%s:%s", o.Tracker.Kind(), w.Issue.Identifier)
-	fmt.Printf("dispatch: %s session=%s attempt=%d profile=%s\n",
-		w.Issue.Identifier, w.Session.ID, attempt, w.Profile.Name)
+	logging.Log("dispatch",
+		logF("issue_id", w.Issue.ID),
+		logF("issue_identifier", w.Issue.Identifier),
+		logF("session_id", w.Session.ID),
+		logF("attempt", attempt),
+		logF("profile", w.Profile.Name))
 
-	res, runErr := executor.Run(ctx, w.Profile, &w.Issue, o.WorkTreeRoot, false, o.Cfg.Hooks)
+	res, runErr := executor.Run(ctx, w.Profile, &w.Issue, o.WorkTreeRoot, false, executor.RunOpts{
+		Hooks:        o.Cfg.Hooks,
+		StallTimeout: o.Cfg.Agent.StallTimeout,
+	})
 	if runErr != nil {
 		if errors.Is(runErr, executor.ErrBeforeRunDenied) {
 			// Denial: not a failure. Release the issue back to Unclaimed
 			// (operator's quota-gate doing its job).
-			fmt.Printf("skip: before_run_denied issue=%s session=%s reason=%v\n",
-				w.Issue.Identifier, w.Session.ID, runErr)
+			logging.Log("before_run_denied",
+				logF("issue_id", w.Issue.ID),
+				logF("issue_identifier", w.Issue.Identifier),
+				logF("session_id", w.Session.ID),
+				logF("reason", runErr))
 			o.State.Release(w.Issue.ID)
 			return
 		}
 		// Real failure: schedule retry.
 		next := Backoff(attempt, o.Cfg.Agent.MaxRetryBackoff)
 		dueAt := time.Now().Add(next)
-		fmt.Fprintf(os.Stderr, "dispatch_failed: issue=%s session=%s attempt=%d retry_in=%s err=%v\n",
-			w.Issue.Identifier, w.Session.ID, attempt, next, runErr)
+		logging.Log("dispatch_failed",
+			logF("issue_id", w.Issue.ID),
+			logF("issue_identifier", w.Issue.Identifier),
+			logF("session_id", w.Session.ID),
+			logF("attempt", attempt),
+			logF("retry_in", next),
+			logF("err", runErr))
 		o.State.FailAndQueueRetry(w.Issue.ID, attempt, dueAt, runErr.Error(), w.Issue)
 		if o.HookFire != nil {
 			o.HookFire("dispatch_failed", map[string]any{
@@ -251,8 +308,13 @@ func (o *Orchestrator) runWorker(ctx context.Context, w *Worker, attempt int) {
 		return
 	}
 
-	fmt.Printf("dispatch_ok: issue=%s session=%s branch=%s changes=%v duration=%dms\n",
-		w.Issue.Identifier, w.Session.ID, res.Branch, res.HasChanges, res.DurationMs)
+	logging.Log("dispatch_ok",
+		logF("issue_id", w.Issue.ID),
+		logF("issue_identifier", w.Issue.Identifier),
+		logF("session_id", w.Session.ID),
+		logF("branch", res.Branch),
+		logF("changes", res.HasChanges),
+		logF("duration_ms", res.DurationMs))
 
 	if w.Profile.OnSuccess != "open_pr" || !res.HasChanges {
 		o.State.Release(w.Issue.ID)
@@ -260,19 +322,30 @@ func (o *Orchestrator) runWorker(ctx context.Context, w *Worker, attempt int) {
 	}
 
 	if o.PROpener == nil {
-		fmt.Fprintf(os.Stderr, "pr_opener_nil: issue=%s — workspace preserved at %s\n",
-			w.Issue.Identifier, res.WorkTree)
+		logging.Log("pr_opener_nil",
+			logF("issue_id", w.Issue.ID),
+			logF("issue_identifier", w.Issue.Identifier),
+			logF("session_id", w.Session.ID),
+			logF("worktree", res.WorkTree))
 		o.State.Release(w.Issue.ID)
 		return
 	}
 	url, err := o.PROpener(ctx, w.Issue, w.Profile, res)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "pr_open_failed: issue=%s session=%s err=%v\n",
-			w.Issue.Identifier, w.Session.ID, err)
+		logging.Log("pr_open_failed",
+			logF("issue_id", w.Issue.ID),
+			logF("issue_identifier", w.Issue.Identifier),
+			logF("session_id", w.Session.ID),
+			logF("err", err))
 		o.State.Release(w.Issue.ID)
 		return
 	}
-	fmt.Printf("pr_opened: %s session=%s\n", url, w.Session.ID)
+	logging.Log("pr_opened",
+		logF("issue_id", w.Issue.ID),
+		logF("issue_identifier", w.Issue.Identifier),
+		logF("session_id", w.Session.ID),
+		logF("url", url),
+		logF("branch", res.Branch))
 	if o.HookFire != nil {
 		o.HookFire("pr_opened", map[string]any{
 			"pr":      map[string]any{"url": url, "branch": res.Branch},
@@ -286,7 +359,11 @@ func (o *Orchestrator) runWorker(ctx context.Context, w *Worker, attempt int) {
 	if o.Tracker.Kind() != "github" {
 		body := fmt.Sprintf("Gleaner opened PR via profile `%s`: %s", w.Profile.Name, url)
 		if err := o.Tracker.Comment(ctx, w.Issue.ID, body); err != nil {
-			fmt.Fprintf(os.Stderr, "tracker_comment_failed: %v\n", err)
+			logging.Log("tracker_comment_failed",
+				logF("issue_id", w.Issue.ID),
+				logF("issue_identifier", w.Issue.Identifier),
+				logF("session_id", w.Session.ID),
+				logF("err", err))
 		}
 	}
 	o.State.Release(w.Issue.ID)
@@ -300,8 +377,10 @@ func (o *Orchestrator) Run(ctx context.Context) {
 	if poll == 0 {
 		poll = 10 * time.Minute
 	}
-	fmt.Printf("orchestrator: starting; tracker=%s poll=%s max_concurrent=%d\n",
-		o.Tracker.Kind(), poll, o.Cfg.Agent.MaxConcurrentAgents)
+	logging.Log("orchestrator_start",
+		logF("tracker_kind", o.Tracker.Kind()),
+		logF("poll", poll),
+		logF("max_concurrent", o.Cfg.Agent.MaxConcurrentAgents))
 
 	tick := time.NewTicker(poll)
 	defer tick.Stop()
