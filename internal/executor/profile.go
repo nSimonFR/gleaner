@@ -69,6 +69,13 @@ type RunOpts struct {
 	// via /api/v1/<id> while the worker is still running. Optional —
 	// nil is a no-op.
 	OnWorkspaceReady func(path string)
+
+	// OnDispatchStart fires after `before_run` passes and before the agent
+	// argv is exec'd. The orchestrator hooks this to call Tracker.SetState
+	// with the "In Progress" state, so the board reflects active work.
+	// Deliberately AFTER before_run so a denied dispatch never moves the
+	// board. SPEC §7.1.
+	OnDispatchStart func()
 }
 
 // Run executes the profile against the given issue. The caller owns the
@@ -144,6 +151,13 @@ func runInWorkspace(ctx context.Context, prof *config.Profile, iss *tracker.Issu
 	if err := hook.RunLifecycle(ctx, "before_run", hooks.BeforeRun, wt, env, hooks.Timeout); err != nil {
 		result.Error = err
 		return result, fmt.Errorf("%w: %v", ErrBeforeRunDenied, err)
+	}
+
+	// SPEC §7.1: fire OnDispatchStart now — before_run passed, the agent
+	// is about to exec. The orchestrator uses this to write back
+	// "In Progress" to the tracker board.
+	if opts.OnDispatchStart != nil {
+		opts.OnDispatchStart()
 	}
 
 	// 3. Render template vars + exec the agent command.

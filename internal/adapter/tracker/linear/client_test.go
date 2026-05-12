@@ -261,6 +261,111 @@ func TestQuery_GraphQLErrorsSurfaced(t *testing.T) {
 	}
 }
 
+// TestSetState_HappyPath drives a Todo→In Progress transition end to
+// end: loadStates queries the team workflow once, SetState issues the
+// issueUpdate mutation with the resolved stateID, and the cache prevents
+// a second team query.
+func TestSetState_HappyPath(t *testing.T) {
+	fake := &fakeLinear{
+		t: t,
+		responsesFor: map[string]string{
+			// loadStates query — match by the unique "teams(filter:" snippet
+			// since GraphQL pretty-prints variants of "team" in many places.
+			"teams(filter:": `{"data":{"teams":{"nodes":[{"states":{"nodes":[
+				{"id":"st-todo","name":"Todo"},
+				{"id":"st-prog","name":"In Progress"},
+				{"id":"st-review","name":"In Review"}
+			]}}]}}}`,
+			"issueUpdate": `{"data":{"issueUpdate":{"success":true}}}`,
+		},
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	c := newClient(t, srv)
+	if err := c.SetState(context.Background(), "iss-abc", "In Progress"); err != nil {
+		t.Fatalf("SetState: %v", err)
+	}
+	// Last body should be the issueUpdate mutation carrying st-prog.
+	if !strings.Contains(fake.lastBody, "issueUpdate") || !strings.Contains(fake.lastBody, "st-prog") {
+		t.Errorf("expected issueUpdate w/ stateId=st-prog; got: %s", fake.lastBody)
+	}
+
+	// Case-insensitive lookup: passing the lower-case name should still
+	// resolve to st-prog without re-querying loadStates.
+	fake.lastBody = ""
+	if err := c.SetState(context.Background(), "iss-xyz", "in progress"); err != nil {
+		t.Fatalf("SetState lowercase: %v", err)
+	}
+	if strings.Contains(fake.lastBody, "teams(filter:") {
+		t.Errorf("loadStates re-queried on second call; cache not honored")
+	}
+	if !strings.Contains(fake.lastBody, "st-prog") {
+		t.Errorf("case-insensitive name didn't resolve; got: %s", fake.lastBody)
+	}
+}
+
+// TestSetState_UnknownState: a state name that isn't in the team's workflow
+// must produce a clear error (no mutation is issued).
+func TestSetState_UnknownState(t *testing.T) {
+	fake := &fakeLinear{
+		t: t,
+		responsesFor: map[string]string{
+			"teams(filter:": `{"data":{"teams":{"nodes":[{"states":{"nodes":[
+				{"id":"st-todo","name":"Todo"}
+			]}}]}}}`,
+		},
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	c := newClient(t, srv)
+	err := c.SetState(context.Background(), "iss-abc", "Done")
+	if err == nil {
+		t.Fatal("expected error for unknown state name")
+	}
+	if !strings.Contains(err.Error(), "Done") || !strings.Contains(err.Error(), "workflow state") {
+		t.Errorf("error should name the missing state; got: %v", err)
+	}
+}
+
+// TestSetState_EmptyName: empty state name is a no-op (operator disabled
+// the transition via tracker.in_progress_state: ""). Must NOT hit Linear.
+func TestSetState_EmptyName(t *testing.T) {
+	fake := &fakeLinear{t: t, responsesFor: map[string]string{}}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	c := newClient(t, srv)
+	if err := c.SetState(context.Background(), "iss-abc", ""); err != nil {
+		t.Errorf("empty state name should be silent no-op; got: %v", err)
+	}
+	if fake.lastBody != "" {
+		t.Errorf("empty state name issued a request: %s", fake.lastBody)
+	}
+}
+
+// TestSetState_MutationSuccessFalse: surfacing a non-success response.
+func TestSetState_MutationSuccessFalse(t *testing.T) {
+	fake := &fakeLinear{
+		t: t,
+		responsesFor: map[string]string{
+			"teams(filter:": `{"data":{"teams":{"nodes":[{"states":{"nodes":[
+				{"id":"st-prog","name":"In Progress"}
+			]}}]}}}`,
+			"issueUpdate": `{"data":{"issueUpdate":{"success":false}}}`,
+		},
+	}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+
+	c := newClient(t, srv)
+	err := c.SetState(context.Background(), "iss-abc", "In Progress")
+	if err == nil || !strings.Contains(err.Error(), "success=false") {
+		t.Errorf("expected success=false error; got: %v", err)
+	}
+}
+
 // JSON-decode check: ensure our gqlIssueNode struct can round-trip
 // the canned response shape without nil-deref or silent field drops.
 func TestUnmarshalNode(t *testing.T) {

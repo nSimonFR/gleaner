@@ -11,11 +11,12 @@ import (
 // fakeTracker just supplies Kind() for session ID composition.
 type fakeTracker struct{ kind string }
 
-func (f *fakeTracker) Kind() string                                                        { return f.kind }
-func (f *fakeTracker) EnforceAuth(ctx context.Context) error                               { return nil }
-func (f *fakeTracker) ListActive(ctx context.Context) ([]tracker.Issue, error)             { return nil, nil }
-func (f *fakeTracker) GetState(ctx context.Context, issueID string) (string, error)        { return "", nil }
-func (f *fakeTracker) Comment(ctx context.Context, issueID, body string) error             { return nil }
+func (f *fakeTracker) Kind() string                                                          { return f.kind }
+func (f *fakeTracker) EnforceAuth(ctx context.Context) error                                 { return nil }
+func (f *fakeTracker) ListActive(ctx context.Context) ([]tracker.Issue, error)               { return nil, nil }
+func (f *fakeTracker) GetState(ctx context.Context, issueID string) (string, error)          { return "", nil }
+func (f *fakeTracker) Comment(ctx context.Context, issueID, body string) error               { return nil }
+func (f *fakeTracker) SetState(ctx context.Context, issueID, stateName string) error         { return nil }
 
 // TestNewSession asserts the shape: <kind>:<id>:<attempt>:<random4>.
 func TestNewSession_Shape(t *testing.T) {

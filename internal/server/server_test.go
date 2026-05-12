@@ -17,11 +17,12 @@ import (
 // fakeTracker satisfies tracker.Tracker for tests.
 type fakeTracker struct{ kind string }
 
-func (f *fakeTracker) Kind() string                                                 { return f.kind }
-func (f *fakeTracker) EnforceAuth(ctx context.Context) error                        { return nil }
-func (f *fakeTracker) ListActive(ctx context.Context) ([]tracker.Issue, error)      { return nil, nil }
-func (f *fakeTracker) GetState(ctx context.Context, id string) (string, error)      { return "open", nil }
-func (f *fakeTracker) Comment(ctx context.Context, id, body string) error           { return nil }
+func (f *fakeTracker) Kind() string                                              { return f.kind }
+func (f *fakeTracker) EnforceAuth(ctx context.Context) error                     { return nil }
+func (f *fakeTracker) ListActive(ctx context.Context) ([]tracker.Issue, error)   { return nil, nil }
+func (f *fakeTracker) GetState(ctx context.Context, id string) (string, error)   { return "open", nil }
+func (f *fakeTracker) Comment(ctx context.Context, id, body string) error        { return nil }
+func (f *fakeTracker) SetState(ctx context.Context, id, stateName string) error  { return nil }
 
 func newServerForTest(t *testing.T) (*Server, *orchestrator.State, chan struct{}) {
 	t.Helper()

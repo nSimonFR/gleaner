@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nSimonFR/gleaner/internal/adapter/tracker"
@@ -36,6 +37,12 @@ type Client struct {
 	CodehostRepo string        // owner/repo — fills Issue.Repo (Linear has no native repo concept)
 	Timeout      time.Duration // per HTTP request; defaults to 15s
 	httpClient   *http.Client
+
+	// stateID cache (state name → workflow-state UUID) populated lazily on
+	// first SetState call via loadStates. Linear's workflow-state IDs are
+	// team-scoped and stable; one query per process is sufficient.
+	stateMu       sync.Mutex
+	stateIDByName map[string]string
 }
 
 // New constructs a linear tracker. APIKey and APIKeyFile are mutually
@@ -259,6 +266,95 @@ func (c *Client) Comment(ctx context.Context, issueID, body string) error {
 	if !resp.CommentCreate.Success {
 		return fmt.Errorf("linear tracker: commentCreate returned success=false for issue %s", issueID)
 	}
+	return nil
+}
+
+// SetState moves the Linear issue to the workflow state named `stateName`
+// via the `issueUpdate` GraphQL mutation. State names are team-scoped and
+// resolved through a lazy cache (loadStates). SPEC §7.1.
+//
+// Returns an error when the state name doesn't exist in the team's
+// workflow; callers log + continue (board write-back is cosmetic).
+func (c *Client) SetState(ctx context.Context, issueID, stateName string) error {
+	if stateName == "" {
+		return nil
+	}
+	if err := c.loadKey(); err != nil {
+		return err
+	}
+	if err := c.loadStates(ctx); err != nil {
+		return err
+	}
+	c.stateMu.Lock()
+	stateID, ok := c.stateIDByName[strings.ToLower(stateName)]
+	c.stateMu.Unlock()
+	if !ok {
+		return fmt.Errorf("linear tracker: no workflow state %q in team %s", stateName, c.TeamKey)
+	}
+	const q = `mutation($id: String!, $stateId: String!) {
+		issueUpdate(id: $id, input: { stateId: $stateId }) {
+			success
+		}
+	}`
+	var resp struct {
+		IssueUpdate struct {
+			Success bool `json:"success"`
+		} `json:"issueUpdate"`
+	}
+	if err := c.query(ctx, q, map[string]any{"id": issueID, "stateId": stateID}, &resp); err != nil {
+		return err
+	}
+	if !resp.IssueUpdate.Success {
+		return fmt.Errorf("linear tracker: issueUpdate returned success=false for issue %s state %q", issueID, stateName)
+	}
+	return nil
+}
+
+// loadStates populates the stateIDByName cache for c.TeamKey on first call.
+// Subsequent calls return immediately. State names are stored lower-cased
+// so SetState lookups are case-insensitive (matches Linear's UI behavior).
+func (c *Client) loadStates(ctx context.Context) error {
+	c.stateMu.Lock()
+	if c.stateIDByName != nil {
+		c.stateMu.Unlock()
+		return nil
+	}
+	c.stateMu.Unlock()
+	if c.TeamKey == "" {
+		return fmt.Errorf("linear tracker: TeamKey is required to resolve workflow states")
+	}
+	const q = `query($team: String!) {
+		teams(filter: { key: { eq: $team } }) {
+			nodes {
+				states { nodes { id name } }
+			}
+		}
+	}`
+	var resp struct {
+		Teams struct {
+			Nodes []struct {
+				States struct {
+					Nodes []struct {
+						ID   string `json:"id"`
+						Name string `json:"name"`
+					} `json:"nodes"`
+				} `json:"states"`
+			} `json:"nodes"`
+		} `json:"teams"`
+	}
+	if err := c.query(ctx, q, map[string]any{"team": c.TeamKey}, &resp); err != nil {
+		return fmt.Errorf("linear tracker: load workflow states: %w", err)
+	}
+	if len(resp.Teams.Nodes) == 0 {
+		return fmt.Errorf("linear tracker: team %q not found", c.TeamKey)
+	}
+	cache := make(map[string]string, len(resp.Teams.Nodes[0].States.Nodes))
+	for _, s := range resp.Teams.Nodes[0].States.Nodes {
+		cache[strings.ToLower(s.Name)] = s.ID
+	}
+	c.stateMu.Lock()
+	c.stateIDByName = cache
+	c.stateMu.Unlock()
 	return nil
 }
 

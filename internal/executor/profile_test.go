@@ -250,6 +250,85 @@ func TestRunInWorkspace_NoHooks(t *testing.T) {
 	}
 }
 
+// TestRunInWorkspace_OnDispatchStartFiresAfterBeforeRun: OnDispatchStart
+// (used by the orchestrator to call Tracker.SetState("In Progress"))
+// MUST fire after before_run passes and BEFORE the agent exec — so a
+// denied dispatch never moves the board.
+func TestRunInWorkspace_OnDispatchStartFiresAfterBeforeRun(t *testing.T) {
+	root := t.TempDir()
+	wt := filepath.Join(root, "ws")
+	if err := os.MkdirAll(wt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	log := filepath.Join(root, "order.log")
+	emit := func(label string) string { return "echo " + label + " >> " + log }
+	hooks := config.Hooks{
+		AfterCreate: emit("after_create"),
+		BeforeRun:   emit("before_run"),
+		Timeout:     5 * time.Second,
+	}
+	prof := &config.Profile{
+		Name:    "test",
+		Run:     []string{"sh", "-c", "echo agent >> " + log},
+		Cwd:     wt,
+		Timeout: 5 * time.Second,
+	}
+	opts := RunOpts{
+		Hooks:           hooks,
+		OnDispatchStart: func() { _ = os.WriteFile(log, append(readAll(log), []byte("dispatch_start\n")...), 0o644) },
+	}
+	if _, err := runInWorkspace(context.Background(), prof, testIssue(), wt, true, opts, &Result{}); err != nil {
+		t.Fatalf("runInWorkspace: %v", err)
+	}
+	got := strings.Split(strings.TrimSpace(string(readAll(log))), "\n")
+	want := []string{"after_create", "before_run", "dispatch_start", "agent"}
+	for i, w := range want {
+		if i >= len(got) || got[i] != w {
+			t.Errorf("position %d: got %q, want %q (full sequence: %v)", i, safeIndex(got, i), w, got)
+		}
+	}
+}
+
+// TestRunInWorkspace_OnDispatchStartSkippedOnBeforeRunDenial: when
+// before_run exits non-zero, OnDispatchStart MUST NOT fire (otherwise the
+// board would be moved to "In Progress" for a denied dispatch).
+func TestRunInWorkspace_OnDispatchStartSkippedOnBeforeRunDenial(t *testing.T) {
+	root := t.TempDir()
+	wt := filepath.Join(root, "ws")
+	if err := os.MkdirAll(wt, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fired := false
+	hooks := config.Hooks{
+		BeforeRun: "exit 1",
+		Timeout:   5 * time.Second,
+	}
+	prof := &config.Profile{Name: "test", Run: []string{"true"}, Cwd: wt, Timeout: 5 * time.Second}
+	opts := RunOpts{
+		Hooks:           hooks,
+		OnDispatchStart: func() { fired = true },
+	}
+	_, err := runInWorkspace(context.Background(), prof, testIssue(), wt, true, opts, &Result{})
+	if !errors.Is(err, ErrBeforeRunDenied) {
+		t.Fatalf("expected ErrBeforeRunDenied; got %v", err)
+	}
+	if fired {
+		t.Error("OnDispatchStart MUST NOT fire when before_run denies the dispatch")
+	}
+}
+
+func readAll(path string) []byte {
+	b, _ := os.ReadFile(path)
+	return b
+}
+
+func safeIndex(s []string, i int) string {
+	if i >= len(s) {
+		return "(missing)"
+	}
+	return s[i]
+}
+
 // TestRunInWorkspace_OrderOfFire records hook fire order via append to
 // a marker file; ensures after_create → before_run → agent → after_run
 // → before_remove.

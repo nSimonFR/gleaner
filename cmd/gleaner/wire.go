@@ -16,12 +16,19 @@ import (
 func buildTracker(cfg *config.Config) (tracker.Tracker, error) {
 	switch cfg.Tracker.Kind {
 	case "github":
-		return tgithub.New(
+		c := tgithub.New(
 			cfg.Tracker.Account,
 			cfg.Tracker.Repos,
 			cfg.Tracker.Require,
 			cfg.Tracker.Block,
-		), nil
+		)
+		// Projects v2 wiring for SetState (SPEC §7.1). All optional —
+		// when ProjectID/StatusFieldID are empty the adapter auto-discovers
+		// from the first issue passed to SetState.
+		c.ProjectID = cfg.Tracker.ProjectID
+		c.StatusFieldID = cfg.Tracker.StatusFieldID
+		c.StatusFieldName = cfg.Tracker.StatusFieldName
+		return c, nil
 	case "linear":
 		return tlinear.New(
 			cfg.Tracker.APIKeyFile,

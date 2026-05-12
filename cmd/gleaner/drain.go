@@ -17,6 +17,7 @@ import (
 	"github.com/nSimonFR/gleaner/internal/config"
 	"github.com/nSimonFR/gleaner/internal/executor"
 	"github.com/nSimonFR/gleaner/internal/hook"
+	"github.com/nSimonFR/gleaner/internal/orchestrator"
 	"github.com/nSimonFR/gleaner/internal/predicate"
 )
 
@@ -97,10 +98,16 @@ func dispatchAndOpenPR(ctx context.Context, cfg *config.Config, trk tracker.Trac
 	taskID := fmt.Sprintf("%s:%s", trk.Kind(), issue.Identifier)
 	fmt.Printf("dispatch: %s → profile=%s (%s)\n", issue.Identifier, profile.Name, strings.Join(profile.Run, " "))
 
+	// SPEC §7.1 — fire SetState("In Progress") AFTER before_run passes.
+	// Drain has no Session so we pass a synthetic id keyed on the task.
+	sessionID := fmt.Sprintf("drain:%s", taskID)
 	res, runErr := executor.Run(ctx, profile, issue, workTreeRoot, false, executor.RunOpts{
 		Hooks:        cfg.Hooks,
 		StallTimeout: cfg.Agent.StallTimeout,
 		TurnTimeout:  cfg.Agent.TurnTimeout,
+		OnDispatchStart: func() {
+			orchestrator.SetStateBestEffort(ctx, trk, *issue, cfg.Tracker.InProgressState, sessionID)
+		},
 	})
 	if runErr != nil {
 		// before_run denial is the operator's quota-gate doing its job —
@@ -161,6 +168,10 @@ func dispatchAndOpenPR(ctx context.Context, cfg *config.Config, trk tracker.Trac
 			fmt.Fprintf(os.Stderr, "tracker_comment_failed: %v\n", err)
 		}
 	}
+
+	// SPEC §7.1: PR opened → board moves to review_state ("In Review").
+	orchestrator.SetStateBestEffort(ctx, trk, *issue, cfg.Tracker.ReviewState, sessionID)
+
 	return nil
 }
 

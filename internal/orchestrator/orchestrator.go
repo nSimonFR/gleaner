@@ -283,6 +283,11 @@ func (o *Orchestrator) runWorker(ctx context.Context, w *Worker, attempt int) {
 		OnWorkspaceReady: func(path string) {
 			o.State.SetWorkspace(w.Issue.ID, path)
 		},
+		// SPEC §7.1 — fires AFTER before_run passes, so a denied
+		// dispatch never moves the board to "In Progress".
+		OnDispatchStart: func() {
+			SetStateBestEffort(ctx, o.Tracker, w.Issue, o.Cfg.Tracker.InProgressState, w.Session.ID)
+		},
 	})
 	if runErr != nil {
 		if errors.Is(runErr, executor.ErrBeforeRunDenied) {
@@ -394,6 +399,10 @@ func (o *Orchestrator) runWorker(ctx context.Context, w *Worker, attempt int) {
 				logF("err", err))
 		}
 	}
+
+	// SPEC §7.1: PR opened → board moves to review_state ("In Review").
+	SetStateBestEffort(ctx, o.Tracker, w.Issue, o.Cfg.Tracker.ReviewState, w.Session.ID)
+
 	o.State.Release(w.Issue.ID)
 }
 

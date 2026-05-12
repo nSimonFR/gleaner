@@ -101,6 +101,17 @@ type Tracker interface {
 	// Linear-tracker mode, Comment writes to the Linear issue (the
 	// orchestrator's only write-back path when not on GitHub).
 	Comment(ctx context.Context, issueID, body string) error
+
+	// SetState moves the tracker-native state of `issueID` to `stateName`.
+	// Best-effort: callers log errors but a failure must NEVER fail the
+	// dispatch — the issue is still being worked, the board write-back is
+	// purely cosmetic. Implementations cache state-name → state-id lookups
+	// lazily on first call.
+	//
+	// When the tracker has no concept of state for this issue (e.g. GitHub
+	// issue not on any Project v2 board), implementations return nil
+	// silently after a debug log line. SPEC §7.1.
+	SetState(ctx context.Context, issueID, stateName string) error
 }
 
 // IsTerminal reports whether `state` appears in the configured terminal

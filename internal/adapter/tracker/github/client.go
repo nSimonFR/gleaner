@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/nSimonFR/gleaner/internal/adapter/tracker"
@@ -27,10 +28,26 @@ type Client struct {
 	Require []string      // labels every active issue must carry
 	Block   []string      // labels that disqualify an issue
 	Timeout time.Duration // per gh invocation; defaults to 30s
+
+	// Projects v2 wiring for SetState. ProjectID and StatusFieldID are
+	// optional config overrides; when empty, both are auto-discovered
+	// from the first issue passed to SetState. Cache is process-local;
+	// if you run gleaner across repos whose issues live in DIFFERENT
+	// projects, set ProjectID explicitly per Client.
+	ProjectID       string // ProjectV2 node id; auto-discovered when empty
+	StatusFieldName string // option-set field name; defaults to "Status"
+	StatusFieldID   string // ProjectV2SingleSelectField id; auto-discovered when empty
+
+	projectMu      sync.Mutex
+	projectID      string            // resolved
+	statusFieldID  string            // resolved
+	optionIDByName map[string]string // status option name (lower) → ID
 }
 
 // New constructs a github tracker. All fields except Timeout are required
 // for ListActive to return useful results; Timeout defaults to 30s.
+// Projects v2 wiring (ProjectID / StatusFieldID / StatusFieldName) is set
+// by the caller on the returned *Client when configured.
 func New(account string, repos, require, block []string) *Client {
 	return &Client{
 		Account: account,
@@ -177,6 +194,273 @@ func (c *Client) Comment(ctx context.Context, issueID, body string) error {
 		"--repo", repo, "--body", body)
 	if err != nil {
 		return fmt.Errorf("gh issue comment %s: %w", issueID, err)
+	}
+	return nil
+}
+
+// SetState moves the issue's Status field on its Projects v2 board to
+// `stateName`. SPEC §7.1. Best-effort: returns nil silently when the issue
+// is not on any Project v2 (logs at debug level via stderr) — operators
+// without a Projects board get no-ops, no errors.
+//
+// On first call the project + Status field option IDs are auto-discovered
+// from the issue's projectItems (unless ProjectID / StatusFieldID are set
+// in config) and cached for subsequent calls.
+func (c *Client) SetState(ctx context.Context, issueID, stateName string) error {
+	if stateName == "" {
+		return nil
+	}
+	repo, num, err := parseGitHubIssueID(issueID)
+	if err != nil {
+		return err
+	}
+
+	// Step 1: resolve issue.node_id (needed for projectItems query).
+	issueNodeID, err := c.issueNodeID(ctx, repo, num)
+	if err != nil {
+		return fmt.Errorf("github tracker: resolve node_id for %s: %w", issueID, err)
+	}
+
+	// Step 2: ensure project + field + option cache.
+	if err := c.loadProjectAndFields(ctx, issueNodeID); err != nil {
+		return err
+	}
+	c.projectMu.Lock()
+	projectID := c.projectID
+	fieldID := c.statusFieldID
+	optionID, optionOK := c.optionIDByName[strings.ToLower(stateName)]
+	c.projectMu.Unlock()
+	if projectID == "" {
+		// loadProjectAndFields couldn't find any project for this issue;
+		// silent no-op already logged inside.
+		return nil
+	}
+	if !optionOK {
+		return fmt.Errorf("github tracker: no Status option %q on project %s", stateName, projectID)
+	}
+
+	// Step 3: locate this issue's ProjectV2Item.id (must re-query per issue
+	// because item IDs are issue-specific).
+	itemID, err := c.projectItemID(ctx, issueNodeID, projectID)
+	if err != nil {
+		return err
+	}
+	if itemID == "" {
+		// Issue not on the cached project — log+skip without erroring.
+		fmt.Fprintf(&bytes.Buffer{}, "github tracker: issue %s not on project %s, skip set_state\n", issueID, projectID)
+		return nil
+	}
+
+	// Step 4: mutation.
+	const mut = `mutation($p: ID!, $i: ID!, $f: ID!, $v: String!) {
+		updateProjectV2ItemFieldValue(input: {
+			projectId: $p,
+			itemId: $i,
+			fieldId: $f,
+			value: { singleSelectOptionId: $v }
+		}) { projectV2Item { id } }
+	}`
+	if err := c.graphql(ctx, mut, map[string]any{
+		"p": projectID, "i": itemID, "f": fieldID, "v": optionID,
+	}, nil); err != nil {
+		return fmt.Errorf("github tracker: updateProjectV2ItemFieldValue: %w", err)
+	}
+	return nil
+}
+
+// issueNodeID resolves an issue's GraphQL node ID from its REST coordinates.
+// Uses `gh api repos/{owner}/{repo}/issues/{number} --jq .node_id` which
+// returns the bare string ID, no envelope.
+func (c *Client) issueNodeID(ctx context.Context, repo string, num int) (string, error) {
+	out, err := c.run(ctx, "api", fmt.Sprintf("repos/%s/issues/%d", repo, num), "--jq", ".node_id")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
+// loadProjectAndFields populates the project / field / option-id cache on
+// first call. When ProjectID and StatusFieldID are both set on the Client,
+// we skip the discovery query. Otherwise we read the issue's projectItems
+// to find a project, then enumerate the project's fields to find Status.
+func (c *Client) loadProjectAndFields(ctx context.Context, issueNodeID string) error {
+	c.projectMu.Lock()
+	if c.projectID != "" && c.statusFieldID != "" && c.optionIDByName != nil {
+		c.projectMu.Unlock()
+		return nil
+	}
+	c.projectMu.Unlock()
+
+	projectID := c.ProjectID
+	if projectID == "" {
+		// Auto-discover: first project this issue is in.
+		const q = `query($id: ID!) {
+			node(id: $id) {
+				... on Issue {
+					projectItems(first: 1) {
+						nodes { project { id title } }
+					}
+				}
+			}
+		}`
+		var resp struct {
+			Node struct {
+				ProjectItems struct {
+					Nodes []struct {
+						Project struct {
+							ID    string `json:"id"`
+							Title string `json:"title"`
+						} `json:"project"`
+					} `json:"nodes"`
+				} `json:"projectItems"`
+			} `json:"node"`
+		}
+		if err := c.graphql(ctx, q, map[string]any{"id": issueNodeID}, &resp); err != nil {
+			return fmt.Errorf("github tracker: discover project: %w", err)
+		}
+		if len(resp.Node.ProjectItems.Nodes) == 0 {
+			// Issue isn't on a project; nothing to cache. Subsequent
+			// SetState calls will re-attempt discovery for OTHER issues
+			// (which may be on a project).
+			return nil
+		}
+		projectID = resp.Node.ProjectItems.Nodes[0].Project.ID
+	}
+
+	// Enumerate fields → pick Status (or configured StatusFieldName).
+	fieldName := c.StatusFieldName
+	if fieldName == "" {
+		fieldName = "Status"
+	}
+	const fq = `query($p: ID!) {
+		node(id: $p) {
+			... on ProjectV2 {
+				fields(first: 50) {
+					nodes {
+						... on ProjectV2SingleSelectField {
+							id name
+							options { id name }
+						}
+					}
+				}
+			}
+		}
+	}`
+	var fresp struct {
+		Node struct {
+			Fields struct {
+				Nodes []struct {
+					ID      string `json:"id"`
+					Name    string `json:"name"`
+					Options []struct {
+						ID   string `json:"id"`
+						Name string `json:"name"`
+					} `json:"options"`
+				} `json:"nodes"`
+			} `json:"fields"`
+		} `json:"node"`
+	}
+	if err := c.graphql(ctx, fq, map[string]any{"p": projectID}, &fresp); err != nil {
+		return fmt.Errorf("github tracker: load project fields: %w", err)
+	}
+	var statusFieldID string
+	options := map[string]string{}
+	for _, f := range fresp.Node.Fields.Nodes {
+		if f.ID == "" {
+			continue // a non-SingleSelect field (Number, Date, …) — fragment yielded zero values
+		}
+		if c.StatusFieldID != "" && f.ID == c.StatusFieldID {
+			statusFieldID = f.ID
+		} else if c.StatusFieldID == "" && strings.EqualFold(f.Name, fieldName) {
+			statusFieldID = f.ID
+		}
+		if f.ID == statusFieldID {
+			for _, o := range f.Options {
+				options[strings.ToLower(o.Name)] = o.ID
+			}
+		}
+	}
+	if statusFieldID == "" {
+		return fmt.Errorf("github tracker: project %s has no SingleSelect field named %q", projectID, fieldName)
+	}
+
+	c.projectMu.Lock()
+	c.projectID = projectID
+	c.statusFieldID = statusFieldID
+	c.optionIDByName = options
+	c.projectMu.Unlock()
+	return nil
+}
+
+// projectItemID locates the ProjectV2Item for `issueNodeID` on `projectID`.
+// Returns "" (no error) when the issue isn't on the project — caller
+// treats that as a silent no-op.
+func (c *Client) projectItemID(ctx context.Context, issueNodeID, projectID string) (string, error) {
+	const q = `query($id: ID!) {
+		node(id: $id) {
+			... on Issue {
+				projectItems(first: 10) {
+					nodes { id project { id } }
+				}
+			}
+		}
+	}`
+	var resp struct {
+		Node struct {
+			ProjectItems struct {
+				Nodes []struct {
+					ID      string `json:"id"`
+					Project struct {
+						ID string `json:"id"`
+					} `json:"project"`
+				} `json:"nodes"`
+			} `json:"projectItems"`
+		} `json:"node"`
+	}
+	if err := c.graphql(ctx, q, map[string]any{"id": issueNodeID}, &resp); err != nil {
+		return "", fmt.Errorf("github tracker: locate project item: %w", err)
+	}
+	for _, n := range resp.Node.ProjectItems.Nodes {
+		if n.Project.ID == projectID {
+			return n.ID, nil
+		}
+	}
+	return "", nil
+}
+
+// graphql wraps `gh api graphql -f query=... -F var=...` for typed responses.
+// Variables are passed as repeated `-F key=value` flags (gh handles JSON
+// scalars correctly; for object inputs we serialize them as JSON strings
+// that the GraphQL server parses — but SetState uses only scalar inputs).
+func (c *Client) graphql(ctx context.Context, query string, vars map[string]any, out any) error {
+	args := []string{"api", "graphql", "-f", "query=" + query}
+	for k, v := range vars {
+		args = append(args, "-F", fmt.Sprintf("%s=%v", k, v))
+	}
+	stdout, err := c.run(ctx, args...)
+	if err != nil {
+		return err
+	}
+	var envelope struct {
+		Data   json.RawMessage `json:"data"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
+	}
+	if err := json.Unmarshal([]byte(stdout), &envelope); err != nil {
+		return fmt.Errorf("decode graphql envelope: %w", err)
+	}
+	if len(envelope.Errors) > 0 {
+		msgs := make([]string, len(envelope.Errors))
+		for i, e := range envelope.Errors {
+			msgs[i] = e.Message
+		}
+		return fmt.Errorf("graphql errors: %s", strings.Join(msgs, "; "))
+	}
+	if out != nil && len(envelope.Data) > 0 {
+		if err := json.Unmarshal(envelope.Data, out); err != nil {
+			return fmt.Errorf("decode graphql data: %w", err)
+		}
 	}
 	return nil
 }

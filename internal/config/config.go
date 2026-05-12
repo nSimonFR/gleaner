@@ -112,6 +112,21 @@ type Tracker struct {
 	// Shared (SPEC §5.3). Used by the orchestrator's reconciliation step.
 	ActiveStates   []string `yaml:"active_states"`
 	TerminalStates []string `yaml:"terminal_states"`
+
+	// Board state names for SPEC §7.1 SetState calls. Defaults match
+	// Linear's stock workflow / GitHub Projects v2 default Status options.
+	// Set either to "" to disable the corresponding transition (no
+	// board write-back).
+	InProgressState string `yaml:"in_progress_state"`
+	ReviewState     string `yaml:"review_state"`
+
+	// GitHub Projects v2 wiring for SetState. Both optional: when unset,
+	// the adapter queries the issue's projectItems on first SetState to
+	// auto-discover. Operators with multiple projects per repo should set
+	// ProjectID explicitly to avoid picking the wrong one.
+	ProjectID       string `yaml:"project_id"`
+	StatusFieldID   string `yaml:"status_field_id"`
+	StatusFieldName string `yaml:"status_field_name"` // default "Status"
 }
 
 type Hours struct {
@@ -167,8 +182,11 @@ func Defaults() Config {
 		Require: []string{"afk-ready"},
 		Block:   []string{"needs-human", "blocked", "wip"},
 		Tracker: Tracker{
-			ActiveStates:   []string{"open"},     // GitHub default; Linear users override
-			TerminalStates: []string{"closed"},   // GitHub default; Linear users override
+			ActiveStates:    []string{"open"},   // GitHub default; Linear users override
+			TerminalStates:  []string{"closed"}, // GitHub default; Linear users override
+			InProgressState: "In Progress",      // SPEC §7.1; both trackers
+			ReviewState:     "In Review",        // SPEC §7.1; both trackers
+			StatusFieldName: "Status",           // GitHub Projects v2 default field name
 		},
 		Hours: Hours{
 			Active: "09:00-19:00",
@@ -384,16 +402,21 @@ type hooksOverlay struct {
 }
 
 type trackerOverlay struct {
-	Kind           *string   `yaml:"kind"`
-	Account        *string   `yaml:"account"`
-	Repos          *[]string `yaml:"repos"`
-	Require        *[]string `yaml:"require"`
-	Block          *[]string `yaml:"block"`
-	APIKeyFile     *string   `yaml:"api_key_file"`
-	TeamKey        *string   `yaml:"team_key"`
-	CodehostRepo   *string   `yaml:"codehost_repo"`
-	ActiveStates   *[]string `yaml:"active_states"`
-	TerminalStates *[]string `yaml:"terminal_states"`
+	Kind            *string   `yaml:"kind"`
+	Account         *string   `yaml:"account"`
+	Repos           *[]string `yaml:"repos"`
+	Require         *[]string `yaml:"require"`
+	Block           *[]string `yaml:"block"`
+	APIKeyFile      *string   `yaml:"api_key_file"`
+	TeamKey         *string   `yaml:"team_key"`
+	CodehostRepo    *string   `yaml:"codehost_repo"`
+	ActiveStates    *[]string `yaml:"active_states"`
+	TerminalStates  *[]string `yaml:"terminal_states"`
+	InProgressState *string   `yaml:"in_progress_state"`
+	ReviewState     *string   `yaml:"review_state"`
+	ProjectID       *string   `yaml:"project_id"`
+	StatusFieldID   *string   `yaml:"status_field_id"`
+	StatusFieldName *string   `yaml:"status_field_name"`
 }
 
 type hoursOverlay struct {
@@ -548,6 +571,21 @@ func (ov *trackerOverlay) applyTo(base *Tracker) {
 	}
 	if ov.TerminalStates != nil {
 		base.TerminalStates = *ov.TerminalStates
+	}
+	if ov.InProgressState != nil {
+		base.InProgressState = *ov.InProgressState
+	}
+	if ov.ReviewState != nil {
+		base.ReviewState = *ov.ReviewState
+	}
+	if ov.ProjectID != nil {
+		base.ProjectID = *ov.ProjectID
+	}
+	if ov.StatusFieldID != nil {
+		base.StatusFieldID = *ov.StatusFieldID
+	}
+	if ov.StatusFieldName != nil {
+		base.StatusFieldName = *ov.StatusFieldName
 	}
 }
 
