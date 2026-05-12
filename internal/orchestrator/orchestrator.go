@@ -204,6 +204,20 @@ func (o *Orchestrator) launchWorker(parentCtx context.Context, iss tracker.Issue
 }
 
 func (o *Orchestrator) runWorker(ctx context.Context, w *Worker, attempt int) {
+	// Panic-safety: if anything panics inside the worker goroutine, the
+	// State would otherwise show this issue stuck in Running forever
+	// (no Elixir-style Process.monitor / :DOWN handler in Go). Drop the
+	// claim + log so the next tick can re-dispatch. SPEC §7.1 doesn't
+	// prescribe this, but it's the obvious analog to Elixir's supervisor
+	// restart semantics.
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "worker_panic: issue=%s session=%s recover=%v\n",
+				w.Issue.Identifier, w.Session.ID, r)
+			o.State.Release(w.Issue.ID)
+		}
+	}()
+
 	taskID := fmt.Sprintf("%s:%s", o.Tracker.Kind(), w.Issue.Identifier)
 	fmt.Printf("dispatch: %s session=%s attempt=%d profile=%s\n",
 		w.Issue.Identifier, w.Session.ID, attempt, w.Profile.Name)
