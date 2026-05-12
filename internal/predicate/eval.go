@@ -5,10 +5,17 @@
 // Result is Decision{Allow, Reason} — never a bare bool, so the operator
 // can always see *why* a dispatch was skipped.
 //
-// Milestone A: the inflight/daily counters are codehost concerns (PRs live
-// on GitHub regardless of which tracker drives issues), so this package
-// takes a *codehost.Client and a repos slice rather than the old
-// `*github.Client` direct dependency.
+// Milestone C: the predicate is split into a *global* tick-level check
+// (EvaluateGlobal — kill, hours, inflight, daily) and a *per-provider*
+// quota check (EvaluateQuota — short/long windows for one provider).
+// The orchestrator runs EvaluateGlobal once per tick, then
+// EvaluateQuota per candidate's profile.Plan. This lets Codex dispatch
+// while Claude is over its short ceiling (and vice versa) — the
+// agent-agnostic value-add.
+//
+// The legacy `Evaluate` function is kept as a thin wrapper for drain's
+// single-shot dispatch path; it does global + a single all-providers
+// pass like v0.0.3.
 package predicate
 
 import (
@@ -44,8 +51,24 @@ type Inputs struct {
 	Now           time.Time
 }
 
-// Evaluate runs all guards in order; returns the first that denies.
-func Evaluate(ctx context.Context, in Inputs) Decision {
+// IsActiveHour returns true if `now` falls in the configured active
+// window (stricter quota ceilings apply). Exported so the orchestrator
+// can pass the same boolean to EvaluateQuota without re-parsing.
+func IsActiveHour(now time.Time, hoursCfg config.Hours) bool {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return inDrainWindow(now, hoursCfg.Active)
+}
+
+// EvaluateGlobal runs the tick-level guards (kill switch, hours,
+// inflight, daily). It does NOT touch QuotaSources — call EvaluateQuota
+// per candidate before dispatch.
+//
+// Returns Decision{Allow: true} when the tick may proceed to consider
+// candidates. The caller still has to clear EvaluateQuota for each
+// candidate's specific provider.
+func EvaluateGlobal(ctx context.Context, in Inputs) Decision {
 	cfg := in.Cfg
 
 	// 1. Kill switch — cheapest check, must be first.
@@ -56,46 +79,18 @@ func Evaluate(ctx context.Context, in Inputs) Decision {
 	}
 
 	// 2. Hours of day.
-	//   - In drain window: proceed with idle threshold (more permissive).
-	//   - In active window: proceed with active threshold (stricter).
-	//   - In neither: deny outright.
 	now := in.Now
 	if now.IsZero() {
 		now = time.Now()
 	}
 	inDrain := inDrainWindow(now, cfg.Hours.Drain)
-	isActiveHour := inDrainWindow(now, cfg.Hours.Active)
-	if !inDrain && !isActiveHour {
+	isActive := inDrainWindow(now, cfg.Hours.Active)
+	if !inDrain && !isActive {
 		return deny("outside_drain_hours (now=%s drain=%s active=%s)",
 			now.Format("15:04"), cfg.Hours.Drain, cfg.Hours.Active)
 	}
 
-	// 3. Quota windows — every provider must clear short_window guard.
-	for _, src := range in.QuotaSources {
-		snap, err := src.Snapshot(ctx)
-		if err != nil {
-			// Soft-deny: don't dispatch if we can't read quota.
-			return deny("quota_read_failed: %s: %v", src.Provider(), err)
-		}
-		if w, ok := snap.Windows["short"]; ok {
-			ceiling := cfg.Guards.ShortWindowIdle
-			if isActiveHour {
-				ceiling = cfg.Guards.ShortWindowActive
-			}
-			if w.UsedPercent > ceiling {
-				return deny("short_window_ceiling_hit (%s short=%.0f%% > %.0f%%)",
-					src.Provider(), w.UsedPercent*100, ceiling*100)
-			}
-		}
-		if w, ok := snap.Windows["long"]; ok {
-			if w.UsedPercent > cfg.Guards.LongWindowCeiling {
-				return deny("long_window_ceiling_hit (%s long=%.0f%% > %.0f%%)",
-					src.Provider(), w.UsedPercent*100, cfg.Guards.LongWindowCeiling*100)
-			}
-		}
-	}
-
-	// 4. Inflight PR count.
+	// 3. Inflight PR count + daily cap.
 	if in.CodeHost != nil && len(in.CodehostRepos) > 0 {
 		inflight, err := in.CodeHost.CountOpenInflight(ctx, in.CodehostRepos)
 		if err != nil {
@@ -104,8 +99,6 @@ func Evaluate(ctx context.Context, in Inputs) Decision {
 		if inflight >= cfg.Guards.InflightPRs {
 			return deny("inflight_cap_hit (%d/%d open PRs)", inflight, cfg.Guards.InflightPRs)
 		}
-
-		// 5. Daily dispatch cap.
 		if cfg.Safety.MaxPerDay > 0 {
 			today, err := in.CodeHost.CountDispatchedToday(ctx, in.CodehostRepos)
 			if err != nil {
@@ -117,6 +110,55 @@ func Evaluate(ctx context.Context, in Inputs) Decision {
 		}
 	}
 
+	return allow()
+}
+
+// EvaluateQuota checks one provider's short and long window against the
+// configured ceilings. `isActive` selects the stricter ceiling
+// (Guards.ShortWindowActive) vs the more permissive
+// (Guards.ShortWindowIdle).
+//
+// Used by the orchestrator before dispatching a candidate: the
+// candidate's profile.Plan picks which QuotaSource to evaluate.
+func EvaluateQuota(ctx context.Context, src adapter.QuotaSource, cfg *config.Config, isActive bool) Decision {
+	snap, err := src.Snapshot(ctx)
+	if err != nil {
+		return deny("quota_read_failed: %s: %v", src.Provider(), err)
+	}
+	if w, ok := snap.Windows["short"]; ok {
+		ceiling := cfg.Guards.ShortWindowIdle
+		if isActive {
+			ceiling = cfg.Guards.ShortWindowActive
+		}
+		if w.UsedPercent > ceiling {
+			return deny("short_window_ceiling_hit (%s short=%.0f%% > %.0f%%)",
+				src.Provider(), w.UsedPercent*100, ceiling*100)
+		}
+	}
+	if w, ok := snap.Windows["long"]; ok {
+		if w.UsedPercent > cfg.Guards.LongWindowCeiling {
+			return deny("long_window_ceiling_hit (%s long=%.0f%% > %.0f%%)",
+				src.Provider(), w.UsedPercent*100, cfg.Guards.LongWindowCeiling*100)
+		}
+	}
+	return allow()
+}
+
+// Evaluate runs all guards in order; returns the first that denies.
+// Legacy v0.0.x entry point — `drain --once` and `bootstrap` use it.
+// New orchestrator code uses EvaluateGlobal + EvaluateQuota separately
+// for per-provider routing.
+func Evaluate(ctx context.Context, in Inputs) Decision {
+	d := EvaluateGlobal(ctx, in)
+	if !d.Allow {
+		return d
+	}
+	isActive := IsActiveHour(in.Now, in.Cfg.Hours)
+	for _, src := range in.QuotaSources {
+		if d := EvaluateQuota(ctx, src, in.Cfg, isActive); !d.Allow {
+			return d
+		}
+	}
 	return allow()
 }
 

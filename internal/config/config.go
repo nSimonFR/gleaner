@@ -31,12 +31,35 @@ type Config struct {
 	// Tracker is the new, kind-aware tracker config. SPEC §5.3.
 	Tracker Tracker `yaml:"tracker"`
 
-	Hours    Hours     `yaml:"hours"`
-	Guards   Guards    `yaml:"guards"`
-	Profiles []Profile `yaml:"profiles"`
-	Hook     string    `yaml:"hook"`  // v0.0.3 event hook (async, fire-and-forget)
-	Hooks    Hooks     `yaml:"hooks"` // Milestone B lifecycle hooks (sync, gating)
-	Safety   Safety    `yaml:"safety"`
+	Hours       Hours       `yaml:"hours"`
+	Guards      Guards      `yaml:"guards"`
+	Profiles    []Profile   `yaml:"profiles"`
+	Hook        string      `yaml:"hook"`        // v0.0.3 event hook (async, fire-and-forget)
+	Hooks       Hooks       `yaml:"hooks"`       // Milestone B lifecycle hooks (sync, gating)
+	Agent       Agent       `yaml:"agent"`       // Milestone C orchestrator settings (SPEC §5.3)
+	Concurrency Concurrency `yaml:"concurrency"` // Milestone C per-provider sub-caps
+	Safety      Safety      `yaml:"safety"`
+}
+
+// Agent mirrors SPEC §5.3 `agent.*`. Defaults come from SPEC verbatim
+// where reasonable; gleaner overrides max_concurrent_agents from 10 to
+// 1 by default to preserve v0.0.x serial semantics. Operators opt into
+// parallel dispatch by raising this.
+type Agent struct {
+	MaxConcurrentAgents int           `yaml:"max_concurrent_agents"`
+	MaxRetryBackoff     time.Duration `yaml:"max_retry_backoff"`
+	MaxTurns            int           `yaml:"max_turns"`     // passed to agent via {max_turns}
+	ReadTimeout         time.Duration `yaml:"read_timeout"`  // Milestone D
+	TurnTimeout         time.Duration `yaml:"turn_timeout"`  // Milestone D
+	StallTimeout        time.Duration `yaml:"stall_timeout"` // Milestone D
+}
+
+// Concurrency is gleaner-native (no SPEC counterpart). Per-provider
+// sub-cap on running workers, keyed by Profile.Plan. The check is
+// applied in addition to Agent.MaxConcurrentAgents. The agnostic-agent
+// value-add: Claude can be busy with the user while Codex drains.
+type Concurrency struct {
+	PerProvider map[string]int `yaml:"per_provider"`
 }
 
 // Hooks mirrors Symphony SPEC §5.3.4 — four lifecycle hooks fired by the
@@ -157,6 +180,14 @@ func Defaults() Config {
 		},
 		Hooks: Hooks{
 			Timeout: 60 * time.Second, // SPEC §5.3.4 default (hooks.timeout_ms = 60000)
+		},
+		Agent: Agent{
+			MaxConcurrentAgents: 1,                // gleaner override: preserve v0.0.x serial pacing
+			MaxRetryBackoff:     5 * time.Minute,  // SPEC §8.4 max_retry_backoff_ms = 300000
+			MaxTurns:            20,               // SPEC §5.3 default
+			ReadTimeout:         5 * time.Second,  // SPEC §5.3.6 (Milestone D)
+			TurnTimeout:         1 * time.Hour,    // SPEC §5.3.6
+			StallTimeout:        5 * time.Minute,  // SPEC §5.3.6
 		},
 	}
 }
@@ -303,17 +334,32 @@ func reconcileTracker(cfg *Config) error {
 // decoder leaves un-set fields as nil — distinguishing "user omitted" from
 // "user wrote 0". Each non-nil field is copied through to the merged Config.
 type configOverlay struct {
-	Account  *string         `yaml:"account"`
-	Repos    *[]string       `yaml:"repos"`
-	Require  *[]string       `yaml:"require"`
-	Block    *[]string       `yaml:"block"`
-	Tracker  *trackerOverlay `yaml:"tracker"`
-	Hours    *hoursOverlay   `yaml:"hours"`
-	Guards   *guardsOverlay  `yaml:"guards"`
-	Profiles *[]Profile      `yaml:"profiles"`
-	Hook     *string         `yaml:"hook"`
-	Hooks    *hooksOverlay   `yaml:"hooks"`
-	Safety   *safetyOverlay  `yaml:"safety"`
+	Account     *string             `yaml:"account"`
+	Repos       *[]string           `yaml:"repos"`
+	Require     *[]string           `yaml:"require"`
+	Block       *[]string           `yaml:"block"`
+	Tracker     *trackerOverlay     `yaml:"tracker"`
+	Hours       *hoursOverlay       `yaml:"hours"`
+	Guards      *guardsOverlay      `yaml:"guards"`
+	Profiles    *[]Profile          `yaml:"profiles"`
+	Hook        *string             `yaml:"hook"`
+	Hooks       *hooksOverlay       `yaml:"hooks"`
+	Agent       *agentOverlay       `yaml:"agent"`
+	Concurrency *concurrencyOverlay `yaml:"concurrency"`
+	Safety      *safetyOverlay      `yaml:"safety"`
+}
+
+type agentOverlay struct {
+	MaxConcurrentAgents *int           `yaml:"max_concurrent_agents"`
+	MaxRetryBackoff     *time.Duration `yaml:"max_retry_backoff"`
+	MaxTurns            *int           `yaml:"max_turns"`
+	ReadTimeout         *time.Duration `yaml:"read_timeout"`
+	TurnTimeout         *time.Duration `yaml:"turn_timeout"`
+	StallTimeout        *time.Duration `yaml:"stall_timeout"`
+}
+
+type concurrencyOverlay struct {
+	PerProvider *map[string]int `yaml:"per_provider"`
 }
 
 type hooksOverlay struct {
@@ -422,6 +468,29 @@ func (ov *configOverlay) applyTo(base *Config) {
 		if ov.Hooks.Timeout != nil {
 			base.Hooks.Timeout = *ov.Hooks.Timeout
 		}
+	}
+	if ov.Agent != nil {
+		if ov.Agent.MaxConcurrentAgents != nil {
+			base.Agent.MaxConcurrentAgents = *ov.Agent.MaxConcurrentAgents
+		}
+		if ov.Agent.MaxRetryBackoff != nil {
+			base.Agent.MaxRetryBackoff = *ov.Agent.MaxRetryBackoff
+		}
+		if ov.Agent.MaxTurns != nil {
+			base.Agent.MaxTurns = *ov.Agent.MaxTurns
+		}
+		if ov.Agent.ReadTimeout != nil {
+			base.Agent.ReadTimeout = *ov.Agent.ReadTimeout
+		}
+		if ov.Agent.TurnTimeout != nil {
+			base.Agent.TurnTimeout = *ov.Agent.TurnTimeout
+		}
+		if ov.Agent.StallTimeout != nil {
+			base.Agent.StallTimeout = *ov.Agent.StallTimeout
+		}
+	}
+	if ov.Concurrency != nil && ov.Concurrency.PerProvider != nil {
+		base.Concurrency.PerProvider = *ov.Concurrency.PerProvider
 	}
 	if ov.Safety != nil {
 		if ov.Safety.MaxPerDay != nil {
