@@ -51,19 +51,26 @@ func markers(t *testing.T, dir string) map[string]bool {
 	return out
 }
 
-// TestRunInWorkspace_HappyPath: all 4 hooks fire in order; agent succeeds.
+// TestRunInWorkspace_HappyPath: all 4 hooks fire in order, agent
+// succeeds, and all 5 marker files end up in the parent root (the
+// workspace itself is removed by the deferred cleanup, so markers
+// must be written to a sibling dir that survives).
 func TestRunInWorkspace_HappyPath(t *testing.T) {
-	wt := t.TempDir()
+	root := t.TempDir()
+	wt := filepath.Join(root, "ws")
+	if err := os.MkdirAll(wt, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	hooks := config.Hooks{
-		AfterCreate:  touchHook(filepath.Join(wt, "01-after_create")),
-		BeforeRun:    touchHook(filepath.Join(wt, "02-before_run")),
-		AfterRun:     touchHook(filepath.Join(wt, "03-after_run")),
-		BeforeRemove: touchHook(filepath.Join(wt, "04-before_remove")),
+		AfterCreate:  touchHook(filepath.Join(root, "01-after_create")),
+		BeforeRun:    touchHook(filepath.Join(root, "02-before_run")),
+		AfterRun:     touchHook(filepath.Join(root, "03-after_run")),
+		BeforeRemove: touchHook(filepath.Join(root, "04-before_remove")),
 		Timeout:      5 * time.Second,
 	}
 	prof := &config.Profile{
 		Name:    "test",
-		Run:     []string{"sh", "-c", ": > " + filepath.Join(wt, "agent_ran")},
+		Run:     []string{"sh", "-c", ": > " + filepath.Join(root, "05-agent")},
 		Cwd:     wt,
 		Timeout: 5 * time.Second,
 	}
@@ -74,10 +81,17 @@ func TestRunInWorkspace_HappyPath(t *testing.T) {
 	if res.ExitCode != 0 {
 		t.Errorf("exitCode = %d; want 0", res.ExitCode)
 	}
-	// All 4 markers should be present after the deferred before_remove
-	// fires. The workspace itself is removed by cleanup, so read from a
-	// sibling temp before the call instead. Repeat with a sibling dir:
-	_ = markers
+	got := markers(t, root)
+	for _, want := range []string{"01-after_create", "02-before_run", "03-after_run", "04-before_remove", "05-agent"} {
+		if !got[want] {
+			t.Errorf("expected marker %q to be present (got %v)", want, got)
+		}
+	}
+	// Workspace itself should be removed by the deferred before_remove
+	// + cleanup since cleanup=true.
+	if _, err := os.Stat(wt); !os.IsNotExist(err) {
+		t.Errorf("workspace %s should be removed; stat err=%v", wt, err)
+	}
 }
 
 // TestRunInWorkspace_AfterCreateFatal: after_create exits 1 →
