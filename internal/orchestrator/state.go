@@ -182,13 +182,23 @@ func (s *State) Release(issueID string) {
 }
 
 // CancelAll terminates every running worker. Used on shutdown.
+//
+// Snapshots the cancel funcs under the lock, then releases the mutex
+// BEFORE invoking them — if a worker's cancel propagation calls back
+// into State (e.g. Release on the cancel-receiver side), we'd
+// otherwise deadlock. Elixir's GenServer queue would serialize this
+// naturally; Go's bare mutex does not, so we keep call-out unlocked.
 func (s *State) CancelAll() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	cancels := make([]context.CancelFunc, 0, len(s.running))
 	for _, w := range s.running {
 		if w.Cancel != nil {
-			w.Cancel()
+			cancels = append(cancels, w.Cancel)
 		}
+	}
+	s.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
 	}
 }
 
@@ -226,25 +236,32 @@ func (s *State) RunningByProvider() map[string]int {
 	return out
 }
 
-// SnapshotRunning returns a copy of running workers (for the
-// HTTP /api/v1/state endpoint in Milestone E).
-func (s *State) SnapshotRunning() []*Worker {
+// SnapshotRunning returns value copies of running workers (for the
+// HTTP /api/v1/state endpoint and Tick's reconciliation loop). The
+// copies are detached from the live State maps so readers can iterate
+// without holding the mutex.
+//
+// Cancel funcs are preserved on the copy so the reconciler can fire
+// w.Cancel() against the live worker — this is intentional and the
+// only field that intentionally aliases. All other fields are safe to
+// read off the copy.
+func (s *State) SnapshotRunning() []Worker {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]*Worker, 0, len(s.running))
+	out := make([]Worker, 0, len(s.running))
 	for _, w := range s.running {
-		out = append(out, w)
+		out = append(out, *w)
 	}
 	return out
 }
 
-// SnapshotRetries returns a copy of pending retries.
-func (s *State) SnapshotRetries() []*RetryAttempt {
+// SnapshotRetries returns value copies of pending retries.
+func (s *State) SnapshotRetries() []RetryAttempt {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]*RetryAttempt, 0, len(s.retries))
+	out := make([]RetryAttempt, 0, len(s.retries))
 	for _, r := range s.retries {
-		out = append(out, r)
+		out = append(out, *r)
 	}
 	return out
 }

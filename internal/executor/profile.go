@@ -58,10 +58,11 @@ type Result struct {
 
 // RunOpts bundles the configuration the executor reads from cfg.Hooks
 // and cfg.Agent. Grouped here so call sites stay readable as more
-// agent-wide knobs land in later milestones (read_timeout, turn_timeout).
+// agent-wide knobs land in later milestones.
 type RunOpts struct {
 	Hooks        config.Hooks
 	StallTimeout time.Duration // SPEC §5.3.6 — 0 disables
+	TurnTimeout  time.Duration // SPEC §5.3.6 turn_timeout (overall agent deadline)
 
 	// OnWorkspaceReady fires once the worktree is created and before
 	// hooks/agent run. Lets the orchestrator surface workspace.path
@@ -158,8 +159,35 @@ func runInWorkspace(ctx context.Context, prof *config.Profile, iss *tracker.Issu
 	rendered := renderArgs(prof.Run, vars)
 	renderedCwd := renderString(prof.Cwd, vars)
 
-	timeout := prof.Timeout
-	if timeout == 0 {
+	// SPEC §9.5: the agent's cwd MUST be inside the workspace_root.
+	// Without this check a profile with `cwd: /etc` (or with a `{worktree}`
+	// template that escapes via `..`) would run anywhere. We resolve the
+	// requested cwd and the workspace via filepath.Abs, then require a
+	// prefix match. wt is the actual worktree path; we accept any cwd
+	// that is equal to or a descendant of wt.
+	absWT, err := filepath.Abs(wt)
+	if err != nil {
+		result.Error = err
+		return result, fmt.Errorf("workspace abs path: %w", err)
+	}
+	absCwd, err := filepath.Abs(renderedCwd)
+	if err != nil {
+		result.Error = err
+		return result, fmt.Errorf("cwd abs path: %w", err)
+	}
+	if absCwd != absWT && !strings.HasPrefix(absCwd, absWT+string(filepath.Separator)) {
+		err := fmt.Errorf("cwd %q escapes workspace %q", absCwd, absWT)
+		result.Error = err
+		return result, err
+	}
+
+	// SPEC §5.3.6 turn_timeout: total timeout for the agent run. Falls
+	// back to the profile's own Timeout (legacy) or 30 minutes.
+	timeout := opts.TurnTimeout
+	if timeout <= 0 {
+		timeout = prof.Timeout
+	}
+	if timeout <= 0 {
 		timeout = 30 * time.Minute
 	}
 	cctx, cancel := context.WithTimeout(ctx, timeout)

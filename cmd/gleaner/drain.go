@@ -100,6 +100,7 @@ func dispatchAndOpenPR(ctx context.Context, cfg *config.Config, trk tracker.Trac
 	res, runErr := executor.Run(ctx, profile, issue, workTreeRoot, false, executor.RunOpts{
 		Hooks:        cfg.Hooks,
 		StallTimeout: cfg.Agent.StallTimeout,
+		TurnTimeout:  cfg.Agent.TurnTimeout,
 	})
 	if runErr != nil {
 		// before_run denial is the operator's quota-gate doing its job —
