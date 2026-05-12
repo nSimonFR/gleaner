@@ -1,0 +1,3 @@
+# nix build output (symlink to /nix/store/...)
+/result
+/result-*
