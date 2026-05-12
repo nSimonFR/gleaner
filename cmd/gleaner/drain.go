@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -96,8 +97,14 @@ func dispatchAndOpenPR(ctx context.Context, cfg *config.Config, trk tracker.Trac
 	taskID := fmt.Sprintf("%s:%s", trk.Kind(), issue.Identifier)
 	fmt.Printf("dispatch: %s → profile=%s (%s)\n", issue.Identifier, profile.Name, strings.Join(profile.Run, " "))
 
-	res, runErr := executor.Run(ctx, profile, issue, workTreeRoot, false)
+	res, runErr := executor.Run(ctx, profile, issue, workTreeRoot, false, cfg.Hooks)
 	if runErr != nil {
+		// before_run denial is the operator's quota-gate doing its job —
+		// log as a skip, do NOT fire the dispatch_failed event hook.
+		if errors.Is(runErr, executor.ErrBeforeRunDenied) {
+			fmt.Printf("skip: before_run_denied reason=%v\n", runErr)
+			return nil
+		}
 		fmt.Fprintf(os.Stderr, "dispatch_failed: exit=%d err=%v\n", res.ExitCode, runErr)
 		fireHook(cfg.Hook, "dispatch_failed", map[string]any{
 			"reason":   runErr.Error(),

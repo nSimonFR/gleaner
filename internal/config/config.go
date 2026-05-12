@@ -34,8 +34,29 @@ type Config struct {
 	Hours    Hours     `yaml:"hours"`
 	Guards   Guards    `yaml:"guards"`
 	Profiles []Profile `yaml:"profiles"`
-	Hook     string    `yaml:"hook"`
+	Hook     string    `yaml:"hook"`  // v0.0.3 event hook (async, fire-and-forget)
+	Hooks    Hooks     `yaml:"hooks"` // Milestone B lifecycle hooks (sync, gating)
 	Safety   Safety    `yaml:"safety"`
+}
+
+// Hooks mirrors Symphony SPEC §5.3.4 — four lifecycle hooks fired by the
+// executor around each dispatch attempt. All run via `bash -lc <script>`
+// with cwd = workspace and the same GLEANER_* env the executor exports.
+//
+// Failure semantics per SPEC §9.4 (enforced in executor.Run):
+//   - after_create non-zero  → fatal to dispatch (workspace destroyed)
+//   - before_run  non-zero  → skip dispatch (denial, not failure)
+//   - after_run   non-zero  → log and ignore
+//   - before_remove non-zero → log and ignore
+//
+// SPEC's `hooks.timeout_ms` (default 60000) becomes `hooks.timeout`
+// (default 60s) — gleaner uses Go-duration syntax everywhere.
+type Hooks struct {
+	AfterCreate  string        `yaml:"after_create"`
+	BeforeRun    string        `yaml:"before_run"`
+	AfterRun     string        `yaml:"after_run"`
+	BeforeRemove string        `yaml:"before_remove"`
+	Timeout      time.Duration `yaml:"timeout"`
 }
 
 // Tracker mirrors the SPEC §5.3 `tracker` block. Kind selects the adapter;
@@ -133,6 +154,9 @@ func Defaults() Config {
 		Safety: Safety{
 			MaxPerDay:  5,
 			KillSwitch: "/var/lib/gleaner/disabled",
+		},
+		Hooks: Hooks{
+			Timeout: 60 * time.Second, // SPEC §5.3.4 default (hooks.timeout_ms = 60000)
 		},
 	}
 }
@@ -288,7 +312,16 @@ type configOverlay struct {
 	Guards   *guardsOverlay  `yaml:"guards"`
 	Profiles *[]Profile      `yaml:"profiles"`
 	Hook     *string         `yaml:"hook"`
+	Hooks    *hooksOverlay   `yaml:"hooks"`
 	Safety   *safetyOverlay  `yaml:"safety"`
+}
+
+type hooksOverlay struct {
+	AfterCreate  *string        `yaml:"after_create"`
+	BeforeRun    *string        `yaml:"before_run"`
+	AfterRun     *string        `yaml:"after_run"`
+	BeforeRemove *string        `yaml:"before_remove"`
+	Timeout      *time.Duration `yaml:"timeout"`
 }
 
 type trackerOverlay struct {
@@ -372,6 +405,23 @@ func (ov *configOverlay) applyTo(base *Config) {
 	}
 	if ov.Hook != nil {
 		base.Hook = *ov.Hook
+	}
+	if ov.Hooks != nil {
+		if ov.Hooks.AfterCreate != nil {
+			base.Hooks.AfterCreate = *ov.Hooks.AfterCreate
+		}
+		if ov.Hooks.BeforeRun != nil {
+			base.Hooks.BeforeRun = *ov.Hooks.BeforeRun
+		}
+		if ov.Hooks.AfterRun != nil {
+			base.Hooks.AfterRun = *ov.Hooks.AfterRun
+		}
+		if ov.Hooks.BeforeRemove != nil {
+			base.Hooks.BeforeRemove = *ov.Hooks.BeforeRemove
+		}
+		if ov.Hooks.Timeout != nil {
+			base.Hooks.Timeout = *ov.Hooks.Timeout
+		}
 	}
 	if ov.Safety != nil {
 		if ov.Safety.MaxPerDay != nil {

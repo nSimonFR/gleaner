@@ -1,16 +1,24 @@
 // Package executor runs a config.Profile against an Issue in an isolated
 // worktree. Template-variable substitution turns {prompt}, {worktree},
-// {repo}, {issue_title}, {issue_body}, {issue_number} into the actual
-// values before exec. Captures stdout+stderr for logging; exit code 0 is
-// success, anything else is dispatch_failed.
+// {repo}, {issue_title}, {issue_body}, {issue_number}, {issue_identifier}
+// into the actual values before exec. Captures stdout+stderr for logging;
+// exit code 0 is success, anything else is dispatch_failed.
 //
 // Worktree management: a fresh `git worktree add` under a temp dir,
 // removed on completion. The branch name follows `afk/<repo-base>-<num>-<slug>`.
+//
+// Milestone B: fires four Symphony-SPEC §5.3.4 lifecycle hooks around
+// each Run — after_create, before_run, after_run, before_remove.
+// Failure semantics: before_run non-zero is a denial (returns
+// ErrBeforeRunDenied); after_create non-zero is fatal (returns
+// ErrAfterCreateFailed and tears the workspace down); the other two
+// are best-effort (logged, ignored).
 package executor
 
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,24 +28,39 @@ import (
 
 	"github.com/nSimonFR/gleaner/internal/adapter/tracker"
 	"github.com/nSimonFR/gleaner/internal/config"
+	"github.com/nSimonFR/gleaner/internal/hook"
 )
 
+// ErrBeforeRunDenied means the before_run hook exited non-zero. The
+// dispatch was not attempted; the orchestrator should treat this as a
+// skip, NOT a dispatch failure (it's the operator's quota-gate doing
+// its job, the same way the internal predicate does).
+var ErrBeforeRunDenied = errors.New("before_run hook denied dispatch")
+
+// ErrAfterCreateFailed means the after_create hook exited non-zero on
+// initial workspace creation. The workspace is destroyed and the
+// dispatch attempt aborts. SPEC §9.4: "Fatal to workspace creation".
+var ErrAfterCreateFailed = errors.New("after_create hook failed; workspace destroyed")
+
 type Result struct {
-	Profile      string
-	Branch       string
-	WorkTree     string
-	ExitCode     int
-	DurationMs   int64
-	Stdout       string
-	Stderr       string
-	HasChanges   bool   // worktree had `git diff --quiet` non-zero
-	HeadSHA      string
-	Error        error
+	Profile    string
+	Branch     string
+	WorkTree   string
+	ExitCode   int
+	DurationMs int64
+	Stdout     string
+	Stderr     string
+	HasChanges bool // worktree had `git status --porcelain` non-empty
+	HeadSHA    string
+	Error      error
 }
 
 // Run executes the profile against the given issue. The caller owns the
 // worktree cleanup decision (passed via cleanup bool).
-func Run(ctx context.Context, prof *config.Profile, iss *tracker.Issue, workTreeRoot string, cleanup bool) (*Result, error) {
+//
+// `hooks` carries the 4 lifecycle scripts and timeout from cfg.Hooks.
+// Nil is acceptable — passing a zero Hooks{} skips them all.
+func Run(ctx context.Context, prof *config.Profile, iss *tracker.Issue, workTreeRoot string, cleanup bool, hooks config.Hooks) (*Result, error) {
 	start := time.Now()
 	result := &Result{Profile: prof.Name}
 
@@ -59,9 +82,13 @@ func Run(ctx context.Context, prof *config.Profile, iss *tracker.Issue, workTree
 	}
 	result.WorkTree = wt
 	result.Branch = branch
-	if cleanup {
-		defer cleanupWorkTree(wt)
-	}
+	// cleanup=true means delete workspace at end. We honor that via a
+	// before_remove hook + RemoveAll (see hookEnv below for env passing).
+	defer func() {
+		if cleanup {
+			runBeforeRemoveAndDelete(ctx, hooks, wt, hookEnv(iss, wt))
+		}
+	}()
 
 	// 2. Render template vars in profile.Run.
 	vars := map[string]string{
@@ -75,8 +102,27 @@ func Run(ctx context.Context, prof *config.Profile, iss *tracker.Issue, workTree
 	}
 	rendered := renderArgs(prof.Run, vars)
 	renderedCwd := renderString(prof.Cwd, vars)
+	env := hookEnv(iss, wt)
 
-	// 3. Exec the command.
+	// 3. after_create — fires only on first workspace creation. The current
+	// executor always creates a fresh worktree per Run (no reuse), so this
+	// is equivalent to "after worktree exists". Workspace reuse across
+	// retries (Milestone C) will refine this to gate on first-creation.
+	// SPEC §9.4: failure is fatal — tear the workspace down before returning.
+	if err := hook.RunLifecycle(ctx, "after_create", hooks.AfterCreate, wt, env, hooks.Timeout); err != nil {
+		_ = os.RemoveAll(wt)
+		result.Error = err
+		return result, fmt.Errorf("%w: %v", ErrAfterCreateFailed, err)
+	}
+
+	// 4. before_run — gating hook. Non-zero exit aborts the dispatch attempt
+	// (not a failure — see ErrBeforeRunDenied doc).
+	if err := hook.RunLifecycle(ctx, "before_run", hooks.BeforeRun, wt, env, hooks.Timeout); err != nil {
+		result.Error = err
+		return result, fmt.Errorf("%w: %v", ErrBeforeRunDenied, err)
+	}
+
+	// 5. Exec the command.
 	timeout := prof.Timeout
 	if timeout == 0 {
 		timeout = 30 * time.Minute
@@ -87,12 +133,8 @@ func Run(ctx context.Context, prof *config.Profile, iss *tracker.Issue, workTree
 	cmd := exec.CommandContext(cctx, rendered[0], rendered[1:]...)
 	cmd.Dir = renderedCwd
 	// Prefix with GLEANER_ to avoid clobbering common env names like PROMPT.
-	cmd.Env = append(os.Environ(),
-		"GLEANER_PROMPT="+vars["prompt"],
-		"GLEANER_WORKTREE="+wt,
-		"GLEANER_REPO="+iss.Repo,
-		"GLEANER_ISSUE="+vars["issue_number"],
-	)
+	cmd.Env = append(os.Environ(), env...)
+	cmd.Env = append(cmd.Env, "GLEANER_PROMPT="+vars["prompt"])
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -100,6 +142,12 @@ func Run(ctx context.Context, prof *config.Profile, iss *tracker.Issue, workTree
 	result.Stdout = stdout.String()
 	result.Stderr = stderr.String()
 	result.DurationMs = time.Since(start).Milliseconds()
+
+	// 6. after_run — always fires, even on dispatch failure. Best-effort
+	// per SPEC §9.4 (failure logged, ignored).
+	if err := hook.RunLifecycle(ctx, "after_run", hooks.AfterRun, wt, env, hooks.Timeout); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+	}
 
 	if runErr != nil {
 		if ee, ok := runErr.(*exec.ExitError); ok {
@@ -112,7 +160,7 @@ func Run(ctx context.Context, prof *config.Profile, iss *tracker.Issue, workTree
 	}
 	result.ExitCode = 0
 
-	// 4. Inspect worktree changes — `status --porcelain` catches BOTH
+	// 7. Inspect worktree changes — `status --porcelain` catches BOTH
 	// modifications to tracked files AND new untracked files. A bare
 	// `git diff --quiet` would miss new-file dispatches entirely.
 	statusCmd := exec.CommandContext(ctx, "git", "-C", wt, "status", "--porcelain")
@@ -126,6 +174,30 @@ func Run(ctx context.Context, prof *config.Profile, iss *tracker.Issue, workTree
 	}
 
 	return result, nil
+}
+
+// hookEnv returns the GLEANER_* env list every lifecycle hook receives.
+// Same shape as what the executor's child command sees (sans GLEANER_PROMPT,
+// which can be large — hooks rarely need it and the command always gets it
+// separately).
+func hookEnv(iss *tracker.Issue, wt string) []string {
+	return []string{
+		"GLEANER_WORKTREE=" + wt,
+		"GLEANER_REPO=" + iss.Repo,
+		"GLEANER_ISSUE=" + fmt.Sprintf("%d", iss.Number),
+		"GLEANER_ISSUE_IDENTIFIER=" + iss.Identifier,
+		"GLEANER_ISSUE_TITLE=" + iss.Title,
+	}
+}
+
+// runBeforeRemoveAndDelete fires before_remove (best-effort, logged) and
+// then deletes the worktree directory. Failure of either step is logged;
+// neither is propagated since the caller has already returned.
+func runBeforeRemoveAndDelete(ctx context.Context, hooks config.Hooks, wt string, env []string) {
+	if err := hook.RunLifecycle(ctx, "before_remove", hooks.BeforeRemove, wt, env, hooks.Timeout); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+	}
+	cleanupWorkTree(wt)
 }
 
 func renderArgs(args []string, vars map[string]string) []string {
@@ -225,8 +297,7 @@ func defaultBranch(ctx context.Context, sourceRepo string) (string, error) {
 func cleanupWorkTree(wt string) {
 	// Best-effort: remove the worktree directory. The source repo's
 	// .git/worktrees/<name> metadata becomes stale; `git worktree prune`
-	// from the source repo will clean it on demand. v0.0.2 callers
-	// usually pass cleanup=false so this is rarely invoked.
+	// from the source repo will clean it on demand.
 	_ = os.RemoveAll(wt)
 }
 
