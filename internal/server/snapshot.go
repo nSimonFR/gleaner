@@ -163,7 +163,7 @@ func (s *Server) BuildSnapshot(ctx context.Context) Snapshot {
 	return snap
 }
 
-func profileName(w *orchestrator.Worker) string {
+func profileName(w orchestrator.Worker) string {
 	if w.Profile == nil {
 		return ""
 	}
@@ -172,7 +172,7 @@ func profileName(w *orchestrator.Worker) string {
 
 // issueRunningJSON renders the per-issue body for an issue currently
 // in state.Running. SPEC §13.7 GET /api/v1/<id>.
-func issueRunningJSON(w *orchestrator.Worker) map[string]any {
+func issueRunningJSON(w orchestrator.Worker) map[string]any {
 	return map[string]any{
 		"issue_id":         w.Issue.ID,
 		"issue_identifier": w.Issue.Identifier,
@@ -196,7 +196,7 @@ func issueRunningJSON(w *orchestrator.Worker) map[string]any {
 
 // issueRetryJSON renders the per-issue body for an issue currently
 // queued for retry.
-func issueRetryJSON(r *orchestrator.RetryAttempt) map[string]any {
+func issueRetryJSON(r orchestrator.RetryAttempt) map[string]any {
 	return map[string]any{
 		"issue_id":         r.Issue.ID,
 		"issue_identifier": r.Issue.Identifier,

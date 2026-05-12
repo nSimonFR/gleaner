@@ -277,6 +277,7 @@ func (o *Orchestrator) runWorker(ctx context.Context, w *Worker, attempt int) {
 	res, runErr := executor.Run(ctx, w.Profile, &w.Issue, o.WorkTreeRoot, false, executor.RunOpts{
 		Hooks:        o.Cfg.Hooks,
 		StallTimeout: o.Cfg.Agent.StallTimeout,
+		TurnTimeout:  o.Cfg.Agent.TurnTimeout,
 		// Surface the workspace path on State.running so /api/v1/<id>
 		// can show it while the worker is still active.
 		OnWorkspaceReady: func(path string) {
@@ -419,7 +420,19 @@ func (o *Orchestrator) Run(ctx context.Context) {
 			logging.Log("orchestrator_shutdown",
 				logF("running", o.State.RunningCount()))
 			o.State.CancelAll()
-			o.wg.Wait()
+			// Race wg.Wait against a hard 30s deadline so a worker
+			// whose hooks ignore ctx cancellation can't hang shutdown
+			// indefinitely. Elixir has BEAM-level supervisor brutal-kill;
+			// Go needs this guard. The orchestrator process is exiting
+			// either way; the timeout just bounds graceful drain.
+			done := make(chan struct{})
+			go func() { o.wg.Wait(); close(done) }()
+			select {
+			case <-done:
+			case <-time.After(30 * time.Second):
+				logging.Log("orchestrator_shutdown_timeout",
+					logF("workers_remaining", o.State.RunningCount()))
+			}
 			return
 		case t := <-tick.C:
 			o.Tick(ctx, t)
