@@ -62,6 +62,12 @@ type Result struct {
 type RunOpts struct {
 	Hooks        config.Hooks
 	StallTimeout time.Duration // SPEC §5.3.6 — 0 disables
+
+	// OnWorkspaceReady fires once the worktree is created and before
+	// hooks/agent run. Lets the orchestrator surface workspace.path
+	// via /api/v1/<id> while the worker is still running. Optional —
+	// nil is a no-op.
+	OnWorkspaceReady func(path string)
 }
 
 // Run executes the profile against the given issue. The caller owns the
@@ -90,6 +96,9 @@ func Run(ctx context.Context, prof *config.Profile, iss *tracker.Issue, workTree
 	}
 	result.WorkTree = wt
 	result.Branch = branch
+	if opts.OnWorkspaceReady != nil {
+		opts.OnWorkspaceReady(wt)
+	}
 	return runInWorkspace(ctx, prof, iss, wt, cleanup, opts, result)
 }
 
@@ -177,17 +186,16 @@ func runInWorkspace(ctx context.Context, prof *config.Profile, iss *tracker.Issu
 	result.Stderr = es.String()
 	result.DurationMs = time.Since(start).Milliseconds()
 
-	// Distinguish a stall-induced kill from any other runErr. The watcher
-	// fires `stalled` (buffered) with the observed silence duration when
-	// it kills; we check non-blockingly.
-	stallFired := false
-	var stallSilentFor time.Duration
-	select {
-	case d, ok := <-stalled:
-		stallFired = ok
-		stallSilentFor = d
-	default:
-	}
+	// Distinguish a stall-induced kill from any other runErr. The
+	// watcher closes `stalled` when it exits, so a blocking receive
+	// after stopWatch yields:
+	//   - (silentFor, ok=true)  → watcher killed the child on stall
+	//   - (zero, ok=false)      → watcher exited via ctx without firing
+	// This avoids the previous race where main raced the watcher's
+	// channel send.
+	d, ok := <-stalled
+	stallFired := ok
+	stallSilentFor := d
 
 	// 4. after_run — always fires, even on dispatch failure. Best-effort
 	// per SPEC §9.4 (failure logged, ignored). Carries an extra

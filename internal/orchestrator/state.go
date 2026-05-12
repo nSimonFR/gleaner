@@ -68,6 +68,11 @@ type Worker struct {
 	StartedAt   time.Time
 	LastEvent   time.Time
 	LastMessage string
+	// Workspace is the worktree path; populated by the
+	// OnWorkspaceReady executor callback as soon as `git worktree add`
+	// succeeds, so the HTTP API can surface it while the worker is
+	// still running.
+	Workspace string
 	// Cancel terminates the worker mid-flight (Milestone D's
 	// reconciliation: kill workers whose issue went terminal).
 	Cancel context.CancelFunc
@@ -184,6 +189,17 @@ func (s *State) CancelAll() {
 		if w.Cancel != nil {
 			w.Cancel()
 		}
+	}
+}
+
+// SetWorkspace records the worktree path for a running worker. Called
+// by the executor's OnWorkspaceReady callback so the HTTP API can
+// surface workspace.path while the worker is still running.
+func (s *State) SetWorkspace(issueID, path string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if w, ok := s.running[issueID]; ok {
+		w.Workspace = path
 	}
 }
 

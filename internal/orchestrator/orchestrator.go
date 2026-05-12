@@ -277,6 +277,11 @@ func (o *Orchestrator) runWorker(ctx context.Context, w *Worker, attempt int) {
 	res, runErr := executor.Run(ctx, w.Profile, &w.Issue, o.WorkTreeRoot, false, executor.RunOpts{
 		Hooks:        o.Cfg.Hooks,
 		StallTimeout: o.Cfg.Agent.StallTimeout,
+		// Surface the workspace path on State.running so /api/v1/<id>
+		// can show it while the worker is still active.
+		OnWorkspaceReady: func(path string) {
+			o.State.SetWorkspace(w.Issue.ID, path)
+		},
 	})
 	if runErr != nil {
 		if errors.Is(runErr, executor.ErrBeforeRunDenied) {
