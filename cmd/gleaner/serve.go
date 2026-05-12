@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"time"
 
 	"github.com/nSimonFR/gleaner/internal/adapter"
 	"github.com/nSimonFR/gleaner/internal/adapter/claude_oauth"
@@ -13,7 +12,8 @@ import (
 	"github.com/nSimonFR/gleaner/internal/adapter/codex_journal"
 	"github.com/nSimonFR/gleaner/internal/adapter/tracker"
 	"github.com/nSimonFR/gleaner/internal/config"
-	"github.com/nSimonFR/gleaner/internal/predicate"
+	"github.com/nSimonFR/gleaner/internal/executor"
+	"github.com/nSimonFR/gleaner/internal/orchestrator"
 )
 
 func serveCmd(ctx context.Context, args []string) int {
@@ -46,61 +46,48 @@ func serveCmd(ctx context.Context, args []string) int {
 	ch := buildCodeHost(cfg)
 	chRepos := codehostRepos(cfg)
 
-	sources := []adapter.QuotaSource{
-		&claude_oauth.Adapter{},
-		&codex_journal.Adapter{},
+	quotaSources := map[string]adapter.QuotaSource{
+		"claude": &claude_oauth.Adapter{},
+		"codex":  &codex_journal.Adapter{},
 	}
 
-	poll := cfg.Hours.Poll
-	if poll == 0 {
-		poll = 10 * time.Minute
-	}
-	fmt.Printf("serve: starting; tracker=%s poll=%s profiles=%d\n", trk.Kind(), poll, len(cfg.Profiles))
+	// SPEC §16.1: best-effort startup cleanup of terminal-state workspaces.
+	orchestrator.CleanupTerminalWorkspaces(ctx, trk, *workTreeRoot, cfg.Tracker.TerminalStates)
 
-	tick := time.NewTicker(poll)
-	defer tick.Stop()
-
-	runOne := func() {
-		decision := predicate.Evaluate(ctx, predicate.Inputs{
-			Cfg:           cfg,
-			CodeHost:      ch,
-			CodehostRepos: chRepos,
-			QuotaSources:  sources,
-		})
-		if !decision.Allow {
-			fmt.Printf("[%s] skip: %s\n", time.Now().Format(time.RFC3339), decision.Reason)
-			return
-		}
-		fmt.Printf("[%s] predicate: ok — dispatching\n", time.Now().Format(time.RFC3339))
-		runDispatchOnce(ctx, cfg, trk, ch, *workTreeRoot)
+	state := orchestrator.NewState()
+	orch := &orchestrator.Orchestrator{
+		Cfg:           cfg,
+		Tracker:       trk,
+		CodeHost:      ch,
+		CodehostRepos: chRepos,
+		QuotaSources:  quotaSources,
+		WorkTreeRoot:  *workTreeRoot,
+		State:         state,
+		HookFire:      func(event string, payload map[string]any) { fireHook(cfg.Hook, event, payload) },
+		PROpener:      makePROpener(trk, ch),
 	}
 
-	// Fire once immediately, then on every tick.
-	runOne()
-	for {
-		select {
-		case <-ctx.Done():
-			fmt.Println("serve: shutting down")
-			return 0
-		case <-tick.C:
-			runOne()
-		}
-	}
+	orch.Run(ctx)
+	return 0
 }
 
-// runDispatchOnce reuses drain's pickIssue + dispatchAndOpenPR. Logs but
-// does NOT propagate errors — the serve loop must continue across failures.
-func runDispatchOnce(ctx context.Context, cfg *config.Config, trk tracker.Tracker, ch *codehost.Client, wtRoot string) {
-	issue, profile, err := pickIssue(ctx, trk, cfg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "pick: %v\n", err)
-		return
-	}
-	if issue == nil {
-		fmt.Println("no eligible issues")
-		return
-	}
-	if err := dispatchAndOpenPR(ctx, cfg, trk, ch, issue, profile, wtRoot); err != nil {
-		fmt.Fprintf(os.Stderr, "dispatch error: %v\n", err)
+// makePROpener returns a PROpener bound to the Tracker + CodeHost. Mirrors
+// the inline pushBranch+CreatePR dance in drain.go but plugs into the
+// orchestrator's worker goroutine. Shared helpers (pushBranch,
+// worktreeBase, buildPRBody) live in drain.go — they're package-level
+// in cmd/gleaner.
+func makePROpener(trk tracker.Tracker, ch *codehost.Client) orchestrator.PROpener {
+	return func(ctx context.Context, iss tracker.Issue, prof *config.Profile, res *executor.Result) (string, error) {
+		if err := pushBranch(ctx, res.WorkTree, res.Branch); err != nil {
+			return "", err
+		}
+		base, err := worktreeBase(ctx, res.WorkTree)
+		if err != nil {
+			base = "main"
+		}
+		body := buildPRBody(trk.Kind(), &iss, prof, res)
+		return ch.CreatePR(ctx, iss.Repo, base, res.Branch,
+			fmt.Sprintf("afk: %s", iss.Title), body,
+			[]string{"afk", "needs-review"})
 	}
 }
