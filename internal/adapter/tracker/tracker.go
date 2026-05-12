@@ -47,6 +47,12 @@ type Issue struct {
 
 	// Priority follows Linear's 0=none, 1=urgent, 2=high, 3=medium, 4=low.
 	// GitHub has no priority concept; the GitHub adapter leaves it at 0.
+	//
+	// CAUTION: 0 collides between "no priority set" (Linear) and "GitHub
+	// default" — both produce the same value. The orchestrator's
+	// SPEC §8.1 step 4 sort (priority asc) lands in Milestone C; until
+	// then, do not sort by this field. When sort lands, treat 0 as
+	// LOWEST priority (sort it last), not highest.
 	Priority int
 
 	// BranchName is a suggested branch (Linear ships these per issue;

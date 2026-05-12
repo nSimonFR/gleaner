@@ -118,17 +118,23 @@ type gqlIssueNode struct {
 			Name string `json:"name"`
 		} `json:"nodes"`
 	} `json:"labels"`
-	Relations struct {
+	// inverseRelations on issue X = "relations where X is the target".
+	// For relation type "blocks", that means "issues that block X" —
+	// the actual blockers. Querying `relations` would return the
+	// inverse (issues X blocks), which is the wrong direction for
+	// SPEC §8.1 step 5 (Todo issues with non-terminal blockers are
+	// ineligible). Matches Symphony Elixir's linear/client.ex shape.
+	InverseRelations struct {
 		Nodes []struct {
-			Type         string `json:"type"`
-			RelatedIssue struct {
+			Type  string `json:"type"`
+			Issue struct {
 				ID    string `json:"id"`
 				State struct {
 					Type string `json:"type"`
 				} `json:"state"`
-			} `json:"relatedIssue"`
+			} `json:"issue"`
 		} `json:"nodes"`
-	} `json:"relations"`
+	} `json:"inverseRelations"`
 	CreatedAt time.Time `json:"createdAt"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }
@@ -156,7 +162,7 @@ func (c *Client) ListActive(ctx context.Context) ([]tracker.Issue, error) {
 				id identifier title description branchName url priority
 				state { name type }
 				labels { nodes { name } }
-				relations { nodes { type relatedIssue { id state { type } } } }
+				inverseRelations { nodes { type issue { id state { type } } } }
 				createdAt updatedAt
 			}
 		}
@@ -172,17 +178,24 @@ func (c *Client) ListActive(ctx context.Context) ([]tracker.Issue, error) {
 	}
 	out := make([]tracker.Issue, 0, len(resp.Issues.Nodes))
 	for _, n := range resp.Issues.Nodes {
+		// Labels lower-cased to match gleaner's profile-matching convention.
+		// GitHub labels are conventionally lowercase; Linear lets operators
+		// store mixed case. cfg.MatchProfile is case-insensitive, but
+		// lowercasing here gives a single canonical form in logs and the
+		// /status JSON (Milestone E). Matches Symphony Elixir's
+		// linear/client.ex:extract_labels.
 		labels := make([]string, 0, len(n.Labels.Nodes))
 		for _, l := range n.Labels.Nodes {
-			labels = append(labels, l.Name)
+			labels = append(labels, strings.ToLower(l.Name))
 		}
-		// SPEC §8.1 step 5: Todo issues with non-terminal blockers are ineligible.
+		// SPEC §8.1 step 5: Todo issues with non-terminal blockers are
+		// ineligible. inverseRelations on this issue = "relations where
+		// this issue is the target" — for type="blocks", the source is
+		// the actual blocker.
 		var blockedBy []string
-		for _, r := range n.Relations.Nodes {
-			// "blocks" relation Type is the inverse — the blocker. We list
-			// IDs of related issues whose state.type is not "completed"/"canceled".
-			if r.Type == "blocks" && r.RelatedIssue.State.Type != "completed" && r.RelatedIssue.State.Type != "canceled" {
-				blockedBy = append(blockedBy, r.RelatedIssue.ID)
+		for _, r := range n.InverseRelations.Nodes {
+			if r.Type == "blocks" && r.Issue.State.Type != "completed" && r.Issue.State.Type != "canceled" {
+				blockedBy = append(blockedBy, r.Issue.ID)
 			}
 		}
 		out = append(out, tracker.Issue{

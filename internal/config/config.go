@@ -231,11 +231,29 @@ func reconcileTracker(cfg *Config) error {
 			if len(cfg.Block) == 0 && len(t.Block) > 0 {
 				cfg.Block = t.Block
 			}
+			// GitHub state defaults match SPEC §5.3 active/terminal pair
+			// for issue lifecycle (open / closed). Operators with custom
+			// labels still override.
+			if len(t.ActiveStates) == 0 {
+				t.ActiveStates = []string{"open"}
+			}
+			if len(t.TerminalStates) == 0 {
+				t.TerminalStates = []string{"closed"}
+			}
 		case "linear":
 			// linear doesn't populate the legacy github fields; that's OK,
 			// codehost callers will use cfg.Tracker.CodehostRepo.
 			if cfg.Account == "" {
 				cfg.Account = t.Account // operator may set explicitly for codehost auth
+			}
+			// SPEC §5.3 defaults for tracker.kind=linear. Without these,
+			// reconciliation (Milestone D) silently has no terminal set
+			// and can't notice when an issue went Done externally.
+			if len(t.ActiveStates) == 0 {
+				t.ActiveStates = []string{"Todo", "In Progress"}
+			}
+			if len(t.TerminalStates) == 0 {
+				t.TerminalStates = []string{"Closed", "Cancelled", "Canceled", "Duplicate", "Done"}
 			}
 		}
 		return nil
@@ -478,10 +496,18 @@ func (c *Config) Validate() error {
 
 // MatchProfile returns the first profile whose `match` matches at least one
 // of the given labels, or has match "*". Returns nil if no profile matches.
+//
+// Matching is case-insensitive: incoming labels and configured matches are
+// both lowercased before comparison. This handles both the GitHub case
+// (labels are case-insensitive in the UI but case-sensitive in the API,
+// which surfaces in unexpected casing) and the Linear case (operators
+// often capitalize labels — `Complexity:Routine` rather than the gleaner
+// convention `complexity:routine`). Without this, a Linear board using
+// PascalCase silently misses every profile match.
 func (c *Config) MatchProfile(labels []string) *Profile {
 	labelSet := make(map[string]struct{}, len(labels))
 	for _, l := range labels {
-		labelSet[l] = struct{}{}
+		labelSet[strings.ToLower(l)] = struct{}{}
 	}
 	for i := range c.Profiles {
 		p := &c.Profiles[i]
@@ -489,7 +515,7 @@ func (c *Config) MatchProfile(labels []string) *Profile {
 			if m == "*" {
 				return p
 			}
-			if _, ok := labelSet[m]; ok {
+			if _, ok := labelSet[strings.ToLower(m)]; ok {
 				return p
 			}
 		}
