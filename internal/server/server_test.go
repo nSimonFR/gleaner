@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nSimonFR/gleaner/internal/adapter/tracker"
 	"github.com/nSimonFR/gleaner/internal/config"
@@ -117,6 +118,52 @@ func TestHandleIssue_NotFound(t *testing.T) {
 	s.handleIssue(w, req)
 	if w.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestHandleIssue_RetryHit(t *testing.T) {
+	s, state, _ := newServerForTest(t)
+	state.TryClaim("R")
+	state.MarkRunning("R", &orchestrator.Worker{
+		Issue:   tracker.Issue{ID: "R", Identifier: "owner/repo#2"},
+		Profile: &config.Profile{Name: "claude"},
+	})
+	state.FailAndQueueRetry("R", 2, time.Now().Add(30*time.Second), "boom",
+		tracker.Issue{ID: "R", Identifier: "owner/repo#2"})
+
+	req := httptest.NewRequest("GET", "/api/v1/owner%2Frepo%232", nil)
+	w := httptest.NewRecorder()
+	s.handleIssue(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", w.Code, w.Body.String())
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp["status"] != "retrying" {
+		t.Errorf("status = %v, want retrying", resp["status"])
+	}
+	attempts, _ := resp["attempts"].(map[string]any)
+	if attempts["current_retry_attempt"].(float64) != 2 {
+		t.Errorf("current_retry_attempt = %v", attempts["current_retry_attempt"])
+	}
+	if resp["last_error"] != "boom" {
+		t.Errorf("last_error = %v", resp["last_error"])
+	}
+	retry, _ := resp["retry"].(map[string]any)
+	if retry["attempt"].(float64) != 2 {
+		t.Errorf("retry.attempt = %v", retry["attempt"])
+	}
+}
+
+func TestHandleHealthz(t *testing.T) {
+	s, _, _ := newServerForTest(t)
+	req := httptest.NewRequest("GET", "/healthz", nil)
+	w := httptest.NewRecorder()
+	s.handleHealthz(w, req)
+	if w.Code != http.StatusOK || strings.TrimSpace(w.Body.String()) != "ok" {
+		t.Errorf("/healthz: status=%d body=%q", w.Code, w.Body.String())
 	}
 }
 

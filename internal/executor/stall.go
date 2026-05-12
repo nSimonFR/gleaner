@@ -73,9 +73,18 @@ func (w *stallWriter) LastWrite() time.Time {
 // if the child has been silent for longer than `timeout`, calls
 // cmd.Process.Kill() and signals the caller via the returned channel
 // with the observed silence duration. The watcher exits when ctx is
-// cancelled (typically by the caller when cmd.Wait returns).
+// cancelled (typically by the caller when cmd.Wait returns) or when
+// it has fired a stall.
 //
-// timeout <= 0 disables stall detection (returns a closed channel).
+// The channel is closed when the watcher exits — callers can do a
+// blocking receive after stopping the watcher to distinguish
+// "watcher exited without firing" (closed → zero-value, ok=false)
+// from "watcher fired a stall" (buffered value present → ok=true,
+// duration carries the silence). This eliminates the race where the
+// main goroutine reads the channel before the watcher's send lands.
+//
+// timeout <= 0 disables stall detection (returns an already-closed
+// channel).
 func watchStall(ctx context.Context, cmd *exec.Cmd, w *stallWriter, timeout time.Duration) <-chan time.Duration {
 	stalled := make(chan time.Duration, 1)
 	if timeout <= 0 {
@@ -92,6 +101,7 @@ func watchStall(ctx context.Context, cmd *exec.Cmd, w *stallWriter, timeout time
 		interval = 100 * time.Millisecond
 	}
 	go func() {
+		defer close(stalled)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 		for {
@@ -105,10 +115,7 @@ func watchStall(ctx context.Context, cmd *exec.Cmd, w *stallWriter, timeout time
 				silent := time.Since(w.LastWrite())
 				if silent > timeout {
 					_ = cmd.Process.Kill()
-					select {
-					case stalled <- silent:
-					default:
-					}
+					stalled <- silent
 					return
 				}
 			}

@@ -50,8 +50,10 @@ type RunningEntry struct {
 	IssueIdentifier string    `json:"issue_identifier"`
 	SessionID       string    `json:"session_id"`
 	Profile         string    `json:"profile"`
+	Workspace       string    `json:"workspace,omitempty"`
 	StartedAt       time.Time `json:"started_at"`
 	LastEventAt     time.Time `json:"last_event_at"`
+	LastMessage     string    `json:"last_message,omitempty"`
 }
 
 type RetryingEntry struct {
@@ -92,8 +94,10 @@ func (s *Server) BuildSnapshot(ctx context.Context) Snapshot {
 			IssueIdentifier: w.Issue.Identifier,
 			SessionID:       w.Session.ID,
 			Profile:         profileName(w),
+			Workspace:       w.Workspace,
 			StartedAt:       w.StartedAt,
 			LastEventAt:     w.LastEvent,
+			LastMessage:     w.LastMessage,
 		})
 	}
 	for _, r := range retries {
@@ -115,19 +119,28 @@ func (s *Server) BuildSnapshot(ctx context.Context) Snapshot {
 	})
 	snap.Predicate = PredicateDecision{Allow: dec.Allow, Reason: dec.Reason}
 
-	// Codehost counts. Best-effort: errors → leave at 0.
+	// Codehost counts. Best-effort: errors → leave at 0. Each remote
+	// call gets its own short deadline so a slow gh shell doesn't
+	// stall the dashboard.
 	if s.CodeHost != nil && len(s.CodehostRepos) > 0 {
-		if n, err := s.CodeHost.CountOpenInflight(ctx, s.CodehostRepos); err == nil {
+		cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		if n, err := s.CodeHost.CountOpenInflight(cctx, s.CodehostRepos); err == nil {
 			snap.InflightPRs = n
 		}
-		if n, err := s.CodeHost.MergedThisWeek(ctx, s.CodehostRepos); err == nil {
+		cancel()
+		cctx, cancel = context.WithTimeout(ctx, 5*time.Second)
+		if n, err := s.CodeHost.MergedThisWeek(cctx, s.CodehostRepos); err == nil {
 			snap.MergedThisWeek = n
 		}
+		cancel()
 	}
 
-	// Quota per provider. Best-effort.
+	// Quota per provider. Best-effort, per-source deadline so one
+	// stuck adapter doesn't hang the dashboard for the others.
 	for name, src := range s.QuotaSources {
-		usage, err := src.Snapshot(ctx)
+		qctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		usage, err := src.Snapshot(qctx)
+		cancel()
 		if err != nil || usage == nil {
 			continue
 		}
@@ -164,7 +177,11 @@ func issueRunningJSON(w *orchestrator.Worker) map[string]any {
 		"issue_id":         w.Issue.ID,
 		"issue_identifier": w.Issue.Identifier,
 		"status":           "running",
-		"workspace":        map[string]any{"path": ""}, // populated when E2's worker-tracking lands; today the orchestrator doesn't keep the path on State
+		"workspace":        map[string]any{"path": w.Workspace},
+		"attempts": map[string]any{
+			"restart_count":          0, // gleaner restarts are per-process, not per-issue; always 0 on a single host
+			"current_retry_attempt":  0, // no retry is pending when we're running
+		},
 		"running": map[string]any{
 			"session_id":    w.Session.ID,
 			"profile":       profileName(w),
@@ -185,7 +202,11 @@ func issueRetryJSON(r *orchestrator.RetryAttempt) map[string]any {
 		"issue_identifier": r.Issue.Identifier,
 		"status":           "retrying",
 		"workspace":        map[string]any{"path": ""},
-		"running":          nil,
+		"attempts": map[string]any{
+			"restart_count":         0,
+			"current_retry_attempt": r.Attempt,
+		},
+		"running": nil,
 		"retry": map[string]any{
 			"attempt": r.Attempt,
 			"due_at":  r.DueAt,

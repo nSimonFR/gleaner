@@ -55,6 +55,7 @@ func (s *Server) Start(ctx context.Context) (*http.Server, error) {
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handleDashboard)
+	mux.HandleFunc("/healthz", s.handleHealthz)
 	mux.HandleFunc("/api/v1/state", s.handleState)
 	mux.HandleFunc("/api/v1/refresh", s.handleRefresh)
 	mux.HandleFunc("/api/v1/", s.handleIssue) // matches /api/v1/<identifier>
@@ -147,6 +148,19 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	http.Error(w, "not found", http.StatusNotFound)
+}
+
+// handleHealthz returns "ok" for liveness probes (Tailscale Serve
+// monitor, rpi5 Beszel checks). No state lookups; just confirms the
+// HTTP path is alive.
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte("ok\n"))
 }
 
 // handleDashboard serves the human-readable HTML at /. Minimal — no

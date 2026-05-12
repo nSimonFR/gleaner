@@ -15,6 +15,7 @@ var dashboardTmpl = template.Must(template.New("dashboard").Funcs(template.FuncM
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta http-equiv="refresh" content="10">
 <title>gleaner — {{.Tracker.Kind}}</title>
 <style>
 body { font-family: monospace; max-width: 900px; margin: 2em auto; padding: 0 1em; }
