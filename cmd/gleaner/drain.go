@@ -108,6 +108,18 @@ func dispatchAndOpenPR(ctx context.Context, cfg *config.Config, trk tracker.Trac
 		OnDispatchStart: func() {
 			orchestrator.SetStateBestEffort(ctx, trk, *issue, cfg.Tracker.InProgressState, sessionID)
 		},
+		// Plan-then-execute mirrors the orchestrator's wiring so drain
+		// emits the same plan-comment behavior as one tick of serve.
+		Phases:   orchestrator.BuildPhases(cfg.Plan),
+		PlanFile: cfg.Plan.File,
+		OnPlanReady: func(planText string) {
+			body := cfg.Plan.CommentHeader + planText
+			if err := trk.Comment(ctx, issue.ID, body); err != nil {
+				fmt.Fprintf(os.Stderr, "plan_comment_failed: %v\n", err)
+				return
+			}
+			fmt.Printf("plan_posted: %s bytes=%d\n", issue.Identifier, len(body))
+		},
 	})
 	if runErr != nil {
 		// before_run denial is the operator's quota-gate doing its job —

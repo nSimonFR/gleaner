@@ -76,6 +76,25 @@ type RunOpts struct {
 	// Deliberately AFTER before_run so a denied dispatch never moves the
 	// board. SPEC §7.1.
 	OnDispatchStart func()
+
+	// Phases describe the agent invocations to run sequentially against
+	// the same workspace. When empty, a single implicit phase runs
+	// (back-compat with v0.1: one invocation, no GLEANER_PHASE env var,
+	// Required=true). When set, each phase is invoked in order; OnPlanReady
+	// fires after a phase named "plan" if PlanFile content is available.
+	Phases      []Phase
+	OnPlanReady func(planText string) // called once between plan and execute phases when PlanFile non-empty
+	PlanFile    string                // path RELATIVE TO worktree, e.g. ".gleaner/PLAN.md"
+}
+
+// Phase is one agent invocation in a multi-phase Run. The convention is
+// two phases: "plan" (best-effort, agent writes PlanFile + exits) and
+// "execute" (required, agent makes the actual changes). Empty PromptTpl
+// means the agent's normal {prompt} is used unchanged.
+type Phase struct {
+	Name      string // exposed to agent + hooks as GLEANER_PHASE
+	PromptTpl string // outer template wrapping {prompt}; empty = pass {prompt} through
+	Required  bool   // exit-code != 0 fails the dispatch; false = log + continue
 }
 
 // Run executes the profile against the given issue. The caller owns the
@@ -160,8 +179,17 @@ func runInWorkspace(ctx context.Context, prof *config.Profile, iss *tracker.Issu
 		opts.OnDispatchStart()
 	}
 
-	// 3. Render template vars + exec the agent command.
-	vars := map[string]string{
+	// Resolve the phase list: explicit Phases win, else fall back to the
+	// implicit single-phase shape (v0.1 back-compat — no GLEANER_PHASE
+	// env var, prompt passed unchanged, agent must succeed).
+	phases := opts.Phases
+	if len(phases) == 0 {
+		phases = []Phase{{Name: "", PromptTpl: "", Required: true}}
+	}
+
+	// Shared template variables. {prompt} starts as the issue prompt;
+	// per-phase PromptTpl wraps it if set.
+	baseVars := map[string]string{
 		"prompt":           buildPrompt(iss),
 		"worktree":         wt,
 		"repo":             iss.Repo,
@@ -169,88 +197,86 @@ func runInWorkspace(ctx context.Context, prof *config.Profile, iss *tracker.Issu
 		"issue_body":       iss.Body,
 		"issue_number":     fmt.Sprintf("%d", iss.Number),
 		"issue_identifier": iss.Identifier,
-	}
-	rendered := renderArgs(prof.Run, vars)
-	renderedCwd := renderString(prof.Cwd, vars)
-
-	// SPEC §9.5: the agent's cwd MUST be inside the workspace_root.
-	// Without this check a profile with `cwd: /etc` (or with a `{worktree}`
-	// template that escapes via `..`) would run anywhere. We resolve the
-	// requested cwd and the workspace via filepath.Abs, then require a
-	// prefix match. wt is the actual worktree path; we accept any cwd
-	// that is equal to or a descendant of wt.
-	absWT, err := filepath.Abs(wt)
-	if err != nil {
-		result.Error = err
-		return result, fmt.Errorf("workspace abs path: %w", err)
-	}
-	absCwd, err := filepath.Abs(renderedCwd)
-	if err != nil {
-		result.Error = err
-		return result, fmt.Errorf("cwd abs path: %w", err)
-	}
-	if absCwd != absWT && !strings.HasPrefix(absCwd, absWT+string(filepath.Separator)) {
-		err := fmt.Errorf("cwd %q escapes workspace %q", absCwd, absWT)
-		result.Error = err
-		return result, err
+		"plan_file":        opts.PlanFile,
 	}
 
-	// SPEC §5.3.6 turn_timeout: total timeout for the agent run. Falls
-	// back to the profile's own Timeout (legacy) or 30 minutes.
-	timeout := opts.TurnTimeout
-	if timeout <= 0 {
-		timeout = prof.Timeout
+	var (
+		lastExit       int
+		lastErr        error
+		stallFired     bool
+		stallSilentFor time.Duration
+	)
+	for _, phase := range phases {
+		phaseVars := make(map[string]string, len(baseVars))
+		for k, v := range baseVars {
+			phaseVars[k] = v
+		}
+		// Phase template wraps the inner {prompt}. Plan phase asks the
+		// agent to write {plan_file} and exit; execute phase passes the
+		// issue prompt straight through.
+		if phase.PromptTpl != "" {
+			phaseVars["prompt"] = renderString(phase.PromptTpl, baseVars)
+		}
+
+		pr, perr := runOneAgentPhase(ctx, prof, phaseVars, env, wt, phase, opts, result, start)
+		if pr != nil {
+			result.Stdout = pr.Stdout
+			result.Stderr = pr.Stderr
+			result.DurationMs = pr.DurationMs
+			lastExit = pr.ExitCode
+			if pr.StallFired {
+				stallFired = true
+				stallSilentFor = pr.StallSilentFor
+				lastErr = perr
+				break
+			}
+		}
+
+		// Between phases: if just-finished phase is "plan", surface the
+		// plan file to the caller via OnPlanReady. The caller posts it
+		// as a tracker comment.
+		if phase.Name == "plan" && opts.OnPlanReady != nil && opts.PlanFile != "" {
+			planPath := filepath.Join(wt, opts.PlanFile)
+			if data, rerr := os.ReadFile(planPath); rerr == nil {
+				txt := strings.TrimSpace(string(data))
+				if txt != "" {
+					opts.OnPlanReady(txt)
+				} else {
+					logging.Log("plan_empty",
+						logging.F("issue_id", iss.ID),
+						logging.F("issue_identifier", iss.Identifier),
+						logging.F("path", planPath))
+				}
+			} else {
+				logging.Log("plan_missing",
+					logging.F("issue_id", iss.ID),
+					logging.F("issue_identifier", iss.Identifier),
+					logging.F("path", planPath),
+					logging.F("err", rerr))
+			}
+		}
+
+		if perr != nil {
+			if phase.Required {
+				lastErr = perr
+				break
+			}
+			// Best-effort phase failed — log and continue to the next phase.
+			logging.Log("phase_failed_best_effort",
+				logging.F("issue_id", iss.ID),
+				logging.F("issue_identifier", iss.Identifier),
+				logging.F("phase", phase.Name),
+				logging.F("exit_code", lastExit),
+				logging.F("err", perr))
+			lastErr = nil
+		}
 	}
-	if timeout <= 0 {
-		timeout = 30 * time.Minute
-	}
-	cctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-
-	cmd := exec.CommandContext(cctx, rendered[0], rendered[1:]...)
-	cmd.Dir = renderedCwd
-	cmd.Env = append(os.Environ(), env...)
-	cmd.Env = append(cmd.Env, "GLEANER_PROMPT="+vars["prompt"])
-	// SPEC §5.3.6 stall detection: a watcher polls the time of the most
-	// recent stdout/stderr Write and SIGKILLs the child if it goes
-	// silent past opts.StallTimeout. The watcher exits when its
-	// context cancels (deferred below).
-	sw := newStallWriter()
-	es := newStallWriter()
-	cmd.Stdout = sw
-	cmd.Stderr = es
-	watchCtx, stopWatch := context.WithCancel(ctx)
-	stalled := watchStall(watchCtx, cmd, sw, opts.StallTimeout)
-	runErr := cmd.Run()
-	stopWatch()
-
-	result.Stdout = sw.String()
-	result.Stderr = es.String()
-	result.DurationMs = time.Since(start).Milliseconds()
-
-	// Distinguish a stall-induced kill from any other runErr. The
-	// watcher closes `stalled` when it exits, so a blocking receive
-	// after stopWatch yields:
-	//   - (silentFor, ok=true)  → watcher killed the child on stall
-	//   - (zero, ok=false)      → watcher exited via ctx without firing
-	// This avoids the previous race where main raced the watcher's
-	// channel send.
-	d, ok := <-stalled
-	stallFired := ok
-	stallSilentFor := d
 
 	// 4. after_run — always fires, even on dispatch failure. Best-effort
 	// per SPEC §9.4 (failure logged, ignored). Carries an extra
-	// GLEANER_EXIT_CODE env so post-mortem hooks know the outcome.
-	exitCode := 0
-	if runErr != nil {
-		if ee, ok := runErr.(*exec.ExitError); ok {
-			exitCode = ee.ExitCode()
-		} else {
-			exitCode = -1
-		}
-	}
-	afterRunEnv := append([]string{fmt.Sprintf("GLEANER_EXIT_CODE=%d", exitCode)}, env...)
+	// GLEANER_EXIT_CODE env so post-mortem hooks know the outcome of the
+	// LAST phase (typically execute).
+	afterRunEnv := append([]string{fmt.Sprintf("GLEANER_EXIT_CODE=%d", lastExit)}, env...)
 	if err := hook.RunLifecycle(ctx, "after_run", hooks.AfterRun, wt, afterRunEnv, hooks.Timeout); err != nil {
 		logging.Log("hook_after_run_failed",
 			logging.F("issue_id", iss.ID),
@@ -260,16 +286,30 @@ func runInWorkspace(ctx context.Context, prof *config.Profile, iss *tracker.Issu
 
 	if stallFired {
 		stallErr := newStalledError(stallSilentFor)
-		result.ExitCode = exitCode
+		result.ExitCode = lastExit
 		result.Error = stallErr
 		return result, stallErr
 	}
-	if runErr != nil {
-		result.ExitCode = exitCode
-		result.Error = runErr
-		return result, runErr
+	if lastErr != nil {
+		result.ExitCode = lastExit
+		result.Error = lastErr
+		return result, lastErr
 	}
 	result.ExitCode = 0
+
+	// Sweep gleaner-managed scratch artifacts (the plan file lives at
+	// {plan_file}, conventionally `.gleaner/PLAN.md`) so they don't get
+	// counted as worktree changes or end up in the resulting PR. Plan
+	// content was already captured via OnPlanReady → tracker comment.
+	if opts.PlanFile != "" {
+		// Delete the plan file itself, then the .gleaner/ dir if empty
+		// — leaves any other agent-owned files alone.
+		planPath := filepath.Join(wt, opts.PlanFile)
+		_ = os.Remove(planPath)
+		if parent := filepath.Dir(planPath); parent != wt {
+			_ = os.Remove(parent) // succeeds only if empty
+		}
+	}
 
 	// 5. Inspect worktree changes — `status --porcelain` catches BOTH
 	// modifications to tracked files AND new untracked files. A bare
@@ -286,6 +326,107 @@ func runInWorkspace(ctx context.Context, prof *config.Profile, iss *tracker.Issu
 	}
 
 	return result, nil
+}
+
+// phaseResult holds the per-phase outcome from one agent invocation —
+// folded back into the top-level Result after the loop in runInWorkspace.
+type phaseResult struct {
+	ExitCode       int
+	Stdout         string
+	Stderr         string
+	DurationMs     int64
+	StallFired     bool
+	StallSilentFor time.Duration
+}
+
+// runOneAgentPhase exec's the profile.Run argv against the rendered
+// phaseVars, with GLEANER_PHASE set to phase.Name (when non-empty).
+// Returns a phaseResult plus a runErr describing the outcome. A non-nil
+// error pairs with a populated ExitCode; a nil error means clean exit.
+func runOneAgentPhase(
+	ctx context.Context,
+	prof *config.Profile,
+	phaseVars map[string]string,
+	env []string,
+	wt string,
+	phase Phase,
+	opts RunOpts,
+	result *Result,
+	start time.Time,
+) (*phaseResult, error) {
+	rendered := renderArgs(prof.Run, phaseVars)
+	renderedCwd := renderString(prof.Cwd, phaseVars)
+
+	// SPEC §9.5: the agent's cwd MUST be inside the workspace_root.
+	absWT, err := filepath.Abs(wt)
+	if err != nil {
+		result.Error = err
+		return nil, fmt.Errorf("workspace abs path: %w", err)
+	}
+	absCwd, err := filepath.Abs(renderedCwd)
+	if err != nil {
+		result.Error = err
+		return nil, fmt.Errorf("cwd abs path: %w", err)
+	}
+	if absCwd != absWT && !strings.HasPrefix(absCwd, absWT+string(filepath.Separator)) {
+		err := fmt.Errorf("cwd %q escapes workspace %q", absCwd, absWT)
+		result.Error = err
+		return nil, err
+	}
+
+	// SPEC §5.3.6 turn_timeout: total timeout for the agent run. Falls
+	// back to the profile's own Timeout (legacy) or 30 minutes. Applies
+	// per phase — plan + execute each get a full turn_timeout budget.
+	timeout := opts.TurnTimeout
+	if timeout <= 0 {
+		timeout = prof.Timeout
+	}
+	if timeout <= 0 {
+		timeout = 30 * time.Minute
+	}
+	cctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(cctx, rendered[0], rendered[1:]...)
+	cmd.Dir = renderedCwd
+	cmd.Env = append(os.Environ(), env...)
+	cmd.Env = append(cmd.Env, "GLEANER_PROMPT="+phaseVars["prompt"])
+	if phase.Name != "" {
+		cmd.Env = append(cmd.Env, "GLEANER_PHASE="+phase.Name)
+	}
+
+	// SPEC §5.3.6 stall detection — per phase. Each phase's stall watcher
+	// is independent: a stalled plan phase doesn't suppress an execute phase
+	// stall watcher.
+	sw := newStallWriter()
+	es := newStallWriter()
+	cmd.Stdout = sw
+	cmd.Stderr = es
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	stalled := watchStall(watchCtx, cmd, sw, opts.StallTimeout)
+	runErr := cmd.Run()
+	stopWatch()
+
+	pr := &phaseResult{
+		Stdout:     sw.String(),
+		Stderr:     es.String(),
+		DurationMs: time.Since(start).Milliseconds(),
+	}
+
+	d, ok := <-stalled
+	pr.StallFired = ok
+	pr.StallSilentFor = d
+
+	if runErr != nil {
+		if ee, ok := runErr.(*exec.ExitError); ok {
+			pr.ExitCode = ee.ExitCode()
+		} else {
+			pr.ExitCode = -1
+		}
+		return pr, runErr
+	}
+	pr.ExitCode = 0
+	return pr, nil
 }
 
 // hookEnv returns the GLEANER_* env list every lifecycle hook receives.

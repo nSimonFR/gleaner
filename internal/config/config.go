@@ -40,6 +40,22 @@ type Config struct {
 	Concurrency Concurrency `yaml:"concurrency"` // Milestone C per-provider sub-caps
 	Server      Server      `yaml:"server"`      // Milestone E HTTP API + dashboard (SPEC §13.7)
 	Safety      Safety      `yaml:"safety"`
+	Plan        Plan        `yaml:"plan"` // plan-then-execute (default on)
+}
+
+// Plan configures the two-phase dispatch flow: the agent first writes a
+// plan to PlanFile, gleaner posts it as a tracker comment, then the agent
+// runs the execute phase. Default-on. Disable with `plan.enabled: false`.
+//
+// The agent contract is convention-based: the plan-phase prompt asks the
+// agent to write a plan to PlanFile and exit without code changes. If the
+// file is missing after the plan phase, gleaner skips the comment and
+// proceeds to execute — best-effort, never blocking.
+type Plan struct {
+	Enabled        bool   `yaml:"enabled"`
+	PromptTemplate string `yaml:"prompt_template"`
+	File           string `yaml:"file"`
+	CommentHeader  string `yaml:"comment_header"`
 }
 
 // Server mirrors SPEC §13.7 `server` block. When Port > 0, gleaner
@@ -203,6 +219,14 @@ func Defaults() Config {
 		Safety: Safety{
 			MaxPerDay:  5,
 			KillSwitch: "/var/lib/gleaner/disabled",
+		},
+		Plan: Plan{
+			Enabled: true,
+			PromptTemplate: "First, write a short plan describing what files you'll touch and what changes you'll make to: {plan_file}. " +
+				"Do NOT make any code changes — exit when the plan is written.\n\n" +
+				"Issue: {prompt}",
+			File:          ".gleaner/PLAN.md",
+			CommentHeader: "## Gleaner plan\n\n",
 		},
 		Hooks: Hooks{
 			Timeout: 60 * time.Second, // SPEC §5.3.4 default (hooks.timeout_ms = 60000)
@@ -374,6 +398,14 @@ type configOverlay struct {
 	Concurrency *concurrencyOverlay `yaml:"concurrency"`
 	Server      *serverOverlay      `yaml:"server"`
 	Safety      *safetyOverlay      `yaml:"safety"`
+	Plan        *planOverlay        `yaml:"plan"`
+}
+
+type planOverlay struct {
+	Enabled        *bool   `yaml:"enabled"`
+	PromptTemplate *string `yaml:"prompt_template"`
+	File           *string `yaml:"file"`
+	CommentHeader  *string `yaml:"comment_header"`
 }
 
 type serverOverlay struct {
@@ -537,6 +569,20 @@ func (ov *configOverlay) applyTo(base *Config) {
 		}
 		if ov.Safety.KillSwitch != nil {
 			base.Safety.KillSwitch = *ov.Safety.KillSwitch
+		}
+	}
+	if ov.Plan != nil {
+		if ov.Plan.Enabled != nil {
+			base.Plan.Enabled = *ov.Plan.Enabled
+		}
+		if ov.Plan.PromptTemplate != nil {
+			base.Plan.PromptTemplate = *ov.Plan.PromptTemplate
+		}
+		if ov.Plan.File != nil {
+			base.Plan.File = *ov.Plan.File
+		}
+		if ov.Plan.CommentHeader != nil {
+			base.Plan.CommentHeader = *ov.Plan.CommentHeader
 		}
 	}
 }

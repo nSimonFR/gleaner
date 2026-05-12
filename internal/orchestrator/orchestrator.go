@@ -288,6 +288,27 @@ func (o *Orchestrator) runWorker(ctx context.Context, w *Worker, attempt int) {
 		OnDispatchStart: func() {
 			SetStateBestEffort(ctx, o.Tracker, w.Issue, o.Cfg.Tracker.InProgressState, w.Session.ID)
 		},
+		// Plan-then-execute two-phase dispatch (when Plan.Enabled). The
+		// plan phase runs first; OnPlanReady posts its output as a
+		// tracker comment before the execute phase starts.
+		Phases:   BuildPhases(o.Cfg.Plan),
+		PlanFile: o.Cfg.Plan.File,
+		OnPlanReady: func(planText string) {
+			body := o.Cfg.Plan.CommentHeader + planText
+			if err := o.Tracker.Comment(ctx, w.Issue.ID, body); err != nil {
+				logging.Log("plan_comment_failed",
+					logF("issue_id", w.Issue.ID),
+					logF("issue_identifier", w.Issue.Identifier),
+					logF("session_id", w.Session.ID),
+					logF("err", err))
+				return
+			}
+			logging.Log("plan_posted",
+				logF("issue_id", w.Issue.ID),
+				logF("issue_identifier", w.Issue.Identifier),
+				logF("session_id", w.Session.ID),
+				logF("bytes", len(body)))
+		},
 	})
 	if runErr != nil {
 		if errors.Is(runErr, executor.ErrBeforeRunDenied) {
