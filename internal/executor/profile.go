@@ -29,6 +29,7 @@ import (
 	"github.com/nSimonFR/gleaner/internal/adapter/tracker"
 	"github.com/nSimonFR/gleaner/internal/config"
 	"github.com/nSimonFR/gleaner/internal/hook"
+	"github.com/nSimonFR/gleaner/internal/logging"
 )
 
 // ErrBeforeRunDenied means the before_run hook exited non-zero. The
@@ -177,11 +178,14 @@ func runInWorkspace(ctx context.Context, prof *config.Profile, iss *tracker.Issu
 	result.DurationMs = time.Since(start).Milliseconds()
 
 	// Distinguish a stall-induced kill from any other runErr. The watcher
-	// fires `stalled` (buffered) when it kills; we check non-blockingly.
+	// fires `stalled` (buffered) with the observed silence duration when
+	// it kills; we check non-blockingly.
 	stallFired := false
+	var stallSilentFor time.Duration
 	select {
-	case _, ok := <-stalled:
+	case d, ok := <-stalled:
 		stallFired = ok
+		stallSilentFor = d
 	default:
 	}
 
@@ -198,13 +202,17 @@ func runInWorkspace(ctx context.Context, prof *config.Profile, iss *tracker.Issu
 	}
 	afterRunEnv := append([]string{fmt.Sprintf("GLEANER_EXIT_CODE=%d", exitCode)}, env...)
 	if err := hook.RunLifecycle(ctx, "after_run", hooks.AfterRun, wt, afterRunEnv, hooks.Timeout); err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
+		logging.Log("hook_after_run_failed",
+			logging.F("issue_id", iss.ID),
+			logging.F("issue_identifier", iss.Identifier),
+			logging.F("err", err))
 	}
 
 	if stallFired {
+		stallErr := newStalledError(stallSilentFor)
 		result.ExitCode = exitCode
-		result.Error = ErrStalled
-		return result, ErrStalled
+		result.Error = stallErr
+		return result, stallErr
 	}
 	if runErr != nil {
 		result.ExitCode = exitCode
@@ -249,9 +257,33 @@ func hookEnv(iss *tracker.Issue, wt string) []string {
 // neither is propagated since the caller has already returned.
 func runBeforeRemoveAndDelete(ctx context.Context, hooks config.Hooks, wt string, env []string) {
 	if err := hook.RunLifecycle(ctx, "before_remove", hooks.BeforeRemove, wt, env, hooks.Timeout); err != nil {
-		fmt.Fprintf(os.Stderr, "%v\n", err)
+		logging.Log("hook_before_remove_failed",
+			logging.F("workspace", wt),
+			logging.F("err", err))
 	}
 	cleanupWorkTree(wt)
+}
+
+// CleanupWorkspace is the exported entry point for the orchestrator to
+// tear down a worktree it created. Fires before_remove (best-effort) and
+// removes the directory. Used by the orchestrator's reconcile-cancel
+// path so terminal-state issues don't leak worktree dirs.
+//
+// `env` should be the same GLEANER_* env the hooks saw during the
+// dispatch — typically constructed via HookEnv(iss, wt).
+func CleanupWorkspace(ctx context.Context, hooks config.Hooks, wt string, env []string) error {
+	if wt == "" {
+		return nil
+	}
+	runBeforeRemoveAndDelete(ctx, hooks, wt, env)
+	return nil
+}
+
+// HookEnv is the exported variant of hookEnv (see below). Lets callers
+// outside this package (the orchestrator) build the same env list that
+// the executor passes to lifecycle hooks.
+func HookEnv(iss *tracker.Issue, wt string) []string {
+	return hookEnv(iss, wt)
 }
 
 func renderArgs(args []string, vars map[string]string) []string {

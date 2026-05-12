@@ -284,6 +284,22 @@ func (o *Orchestrator) runWorker(ctx context.Context, w *Worker, attempt int) {
 			o.State.Release(w.Issue.ID)
 			return
 		}
+		// Reconcile-driven cancel (or shutdown). The parent context is
+		// cancelled, executor.Run returned an exec error because the
+		// child was killed. Clean the workspace and exit without queuing
+		// a retry — reconcile already Released the issue, AND retrying
+		// would be pointless (issue went terminal in the tracker).
+		if ctx.Err() != nil {
+			_ = executor.CleanupWorkspace(context.Background(), o.Cfg.Hooks, res.WorkTree, executor.HookEnv(&w.Issue, res.WorkTree))
+			logging.Log("dispatch_cancelled",
+				logF("issue_id", w.Issue.ID),
+				logF("issue_identifier", w.Issue.Identifier),
+				logF("session_id", w.Session.ID),
+				logF("workspace_cleaned", res.WorkTree))
+			// Don't call Release — reconcile did it already. Calling
+			// twice is harmless but the log line is noise.
+			return
+		}
 		// Real failure: schedule retry.
 		next := Backoff(attempt, o.Cfg.Agent.MaxRetryBackoff)
 		dueAt := time.Now().Add(next)
@@ -389,7 +405,8 @@ func (o *Orchestrator) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Println("orchestrator: shutting down — cancelling running workers")
+			logging.Log("orchestrator_shutdown",
+				logF("running", o.State.RunningCount()))
 			o.State.CancelAll()
 			o.wg.Wait()
 			return
