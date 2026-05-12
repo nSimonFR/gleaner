@@ -18,7 +18,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/nSimonFR/gleaner/internal/adapter/github"
+	"github.com/nSimonFR/gleaner/internal/adapter/tracker"
 	"github.com/nSimonFR/gleaner/internal/config"
 )
 
@@ -37,12 +37,23 @@ type Result struct {
 
 // Run executes the profile against the given issue. The caller owns the
 // worktree cleanup decision (passed via cleanup bool).
-func Run(ctx context.Context, prof *config.Profile, iss *github.Issue, workTreeRoot string, cleanup bool) (*Result, error) {
+func Run(ctx context.Context, prof *config.Profile, iss *tracker.Issue, workTreeRoot string, cleanup bool) (*Result, error) {
 	start := time.Now()
 	result := &Result{Profile: prof.Name}
 
 	// 1. Clone fresh worktree.
-	wt, branch, err := setupWorkTree(ctx, iss.Repo, iss.Number, iss.Title, workTreeRoot)
+	// `issueKey` is the human-meaningful portion used in worktree path and
+	// branch name. For GitHub: the issue number ("60"). For Linear: the
+	// identifier ("MT-649"). Linear issues have Number==0 so we fall back
+	// to Identifier; sanitize it so we don't smuggle "/" into a branch.
+	issueKey := fmt.Sprintf("%d", iss.Number)
+	if iss.Number == 0 {
+		issueKey = slugify(iss.Identifier)
+		if issueKey == "" {
+			issueKey = "task"
+		}
+	}
+	wt, branch, err := setupWorkTree(ctx, iss.Repo, issueKey, iss.Title, workTreeRoot)
 	if err != nil {
 		return result, fmt.Errorf("worktree setup: %w", err)
 	}
@@ -54,12 +65,13 @@ func Run(ctx context.Context, prof *config.Profile, iss *github.Issue, workTreeR
 
 	// 2. Render template vars in profile.Run.
 	vars := map[string]string{
-		"prompt":       buildPrompt(iss),
-		"worktree":     wt,
-		"repo":         iss.Repo,
-		"issue_title":  iss.Title,
-		"issue_body":   iss.Body,
-		"issue_number": fmt.Sprintf("%d", iss.Number),
+		"prompt":           buildPrompt(iss),
+		"worktree":         wt,
+		"repo":             iss.Repo,
+		"issue_title":      iss.Title,
+		"issue_body":       iss.Body,
+		"issue_number":     fmt.Sprintf("%d", iss.Number),
+		"issue_identifier": iss.Identifier,
 	}
 	rendered := renderArgs(prof.Run, vars)
 	renderedCwd := renderString(prof.Cwd, vars)
@@ -131,12 +143,12 @@ func renderString(s string, vars map[string]string) string {
 	return s
 }
 
-func buildPrompt(iss *github.Issue) string {
-	return fmt.Sprintf("GitHub issue %s#%d: %s\n\n%s\n\nMake the change. Commit when done.",
-		iss.Repo, iss.Number, iss.Title, iss.Body)
+func buildPrompt(iss *tracker.Issue) string {
+	return fmt.Sprintf("Issue %s: %s\n\n%s\n\nMake the change. Commit when done.",
+		iss.Identifier, iss.Title, iss.Body)
 }
 
-func setupWorkTree(ctx context.Context, repo string, issueNum int, title, root string) (string, string, error) {
+func setupWorkTree(ctx context.Context, repo, issueKey, title, root string) (string, string, error) {
 	repoBase := repo
 	if i := strings.LastIndex(repo, "/"); i >= 0 {
 		repoBase = repo[i+1:]
@@ -149,8 +161,8 @@ func setupWorkTree(ctx context.Context, repo string, issueNum int, title, root s
 	// don't collide on the worktree path. The branch name also includes it
 	// so retries don't clobber unpushed work.
 	suffix := fmt.Sprintf("%d", time.Now().Unix())
-	branch := fmt.Sprintf("afk/%s-%d-%s-%s", repoBase, issueNum, slug, suffix)
-	wtName := fmt.Sprintf("%s-%d-%s", repoBase, issueNum, suffix)
+	branch := fmt.Sprintf("afk/%s-%s-%s-%s", repoBase, issueKey, slug, suffix)
+	wtName := fmt.Sprintf("%s-%s-%s", repoBase, issueKey, suffix)
 	wt := filepath.Join(root, wtName)
 
 	// Source repo: gleaner doesn't ship clones. Caller must have a local

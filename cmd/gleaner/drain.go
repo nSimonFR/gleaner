@@ -10,8 +10,9 @@ import (
 
 	"github.com/nSimonFR/gleaner/internal/adapter"
 	"github.com/nSimonFR/gleaner/internal/adapter/claude_oauth"
+	codehost "github.com/nSimonFR/gleaner/internal/adapter/codehost/github"
 	"github.com/nSimonFR/gleaner/internal/adapter/codex_journal"
-	"github.com/nSimonFR/gleaner/internal/adapter/github"
+	"github.com/nSimonFR/gleaner/internal/adapter/tracker"
 	"github.com/nSimonFR/gleaner/internal/config"
 	"github.com/nSimonFR/gleaner/internal/executor"
 	"github.com/nSimonFR/gleaner/internal/hook"
@@ -38,20 +39,18 @@ func drainCmd(ctx context.Context, args []string) int {
 		fmt.Fprintln(os.Stderr, "config:", err)
 		return 1
 	}
-	if cfg.Account == "" {
-		fmt.Fprintln(os.Stderr, "config: account is required (e.g. nSimonFR-ai)")
-		return 1
-	}
-	if len(cfg.Repos) == 0 {
-		fmt.Fprintln(os.Stderr, "config: repos must not be empty")
-		return 1
-	}
 
-	gh := github.New(cfg.Account)
-	if err := gh.EnforceAuth(ctx); err != nil {
+	trk, err := buildTracker(cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "tracker:", err)
+		return 1
+	}
+	if err := trk.EnforceAuth(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return 1
 	}
+	ch := buildCodeHost(cfg)
+	chRepos := codehostRepos(cfg)
 
 	sources := []adapter.QuotaSource{
 		&claude_oauth.Adapter{},
@@ -59,7 +58,10 @@ func drainCmd(ctx context.Context, args []string) int {
 	}
 
 	decision := predicate.Evaluate(ctx, predicate.Inputs{
-		Cfg: cfg, GH: gh, QuotaSources: sources,
+		Cfg:           cfg,
+		CodeHost:      ch,
+		CodehostRepos: chRepos,
+		QuotaSources:  sources,
 	})
 	if !decision.Allow {
 		fmt.Printf("skip: %s\n", decision.Reason)
@@ -71,7 +73,7 @@ func drainCmd(ctx context.Context, args []string) int {
 	}
 
 	// Pick one issue.
-	issue, profile, err := pickIssue(ctx, gh, cfg)
+	issue, profile, err := pickIssue(ctx, trk, cfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "pick:", err)
 		return 1
@@ -80,7 +82,7 @@ func drainCmd(ctx context.Context, args []string) int {
 		fmt.Println("skip: no_eligible_issues")
 		return 0
 	}
-	if err := dispatchAndOpenPR(ctx, cfg, gh, issue, profile, *workTreeRoot); err != nil {
+	if err := dispatchAndOpenPR(ctx, cfg, trk, ch, issue, profile, *workTreeRoot); err != nil {
 		return 1
 	}
 	return 0
@@ -90,8 +92,9 @@ func drainCmd(ctx context.Context, args []string) int {
 // the profile's on_success == open_pr and the worktree has changes, opens
 // a PR. Used by both `drain` and `serve`. Returns nil on the full success
 // path or on no-change skips; returns error only on hard failures.
-func dispatchAndOpenPR(ctx context.Context, cfg *config.Config, gh *github.Client, issue *github.Issue, profile *config.Profile, workTreeRoot string) error {
-	fmt.Printf("dispatch: %s#%d → profile=%s (%s)\n", issue.Repo, issue.Number, profile.Name, strings.Join(profile.Run, " "))
+func dispatchAndOpenPR(ctx context.Context, cfg *config.Config, trk tracker.Tracker, ch *codehost.Client, issue *tracker.Issue, profile *config.Profile, workTreeRoot string) error {
+	taskID := fmt.Sprintf("%s:%s", trk.Kind(), issue.Identifier)
+	fmt.Printf("dispatch: %s → profile=%s (%s)\n", issue.Identifier, profile.Name, strings.Join(profile.Run, " "))
 
 	res, runErr := executor.Run(ctx, profile, issue, workTreeRoot, false)
 	if runErr != nil {
@@ -99,7 +102,7 @@ func dispatchAndOpenPR(ctx context.Context, cfg *config.Config, gh *github.Clien
 		fireHook(cfg.Hook, "dispatch_failed", map[string]any{
 			"reason":   runErr.Error(),
 			"profile":  profile.Name,
-			"task_id":  fmt.Sprintf("github:%s#%d", issue.Repo, issue.Number),
+			"task_id":  taskID,
 			"exitcode": res.ExitCode,
 		})
 		return runErr
@@ -115,14 +118,14 @@ func dispatchAndOpenPR(ctx context.Context, cfg *config.Config, gh *github.Clien
 		fmt.Fprintln(os.Stderr, "push:", err)
 		return err
 	}
-	prBody := buildPRBody(issue, profile, res)
+	prBody := buildPRBody(trk.Kind(), issue, profile, res)
 	// Pull the default branch from the worktree (it was branched off
 	// origin/<default>, so HEAD's upstream knows the right base).
 	base, err := worktreeBase(ctx, res.WorkTree)
 	if err != nil {
 		base = "main" // permissive fallback
 	}
-	url, err := gh.CreatePR(ctx, issue.Repo, base, res.Branch,
+	url, err := ch.CreatePR(ctx, issue.Repo, base, res.Branch,
 		fmt.Sprintf("afk: %s", issue.Title), prBody,
 		[]string{"afk", "needs-review"})
 	if err != nil {
@@ -133,40 +136,50 @@ func dispatchAndOpenPR(ctx context.Context, cfg *config.Config, gh *github.Clien
 	fireHook(cfg.Hook, "pr_opened", map[string]any{
 		"pr":      map[string]any{"url": url, "branch": res.Branch},
 		"profile": profile.Name,
-		"task_id": fmt.Sprintf("github:%s#%d", issue.Repo, issue.Number),
+		"task_id": taskID,
 	})
+
+	// For non-github trackers, write the PR URL back to the tracker so the
+	// operator sees the result on their board (SPEC §11.4 equivalent via
+	// orchestrator-owned Comment rather than agent tool calls).
+	if trk.Kind() != "github" {
+		body := fmt.Sprintf("Gleaner opened PR via profile `%s`: %s", profile.Name, url)
+		if err := trk.Comment(ctx, issue.ID, body); err != nil {
+			// Best-effort: log only. PR is already open; tracker write-back
+			// failing should not fail the dispatch.
+			fmt.Fprintf(os.Stderr, "tracker_comment_failed: %v\n", err)
+		}
+	}
 	return nil
 }
 
-func pickIssue(ctx context.Context, gh *github.Client, cfg *config.Config) (*github.Issue, *config.Profile, error) {
-	for _, repo := range cfg.Repos {
-		issues, err := gh.EligibleIssues(ctx, repo, cfg.Require, cfg.Block)
-		if err != nil {
-			return nil, nil, err
+func pickIssue(ctx context.Context, trk tracker.Tracker, cfg *config.Config) (*tracker.Issue, *config.Profile, error) {
+	issues, err := trk.ListActive(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	for i := range issues {
+		iss := issues[i]
+		hasComplexity := false
+		for _, l := range iss.Labels {
+			if strings.HasPrefix(l, "complexity:") {
+				hasComplexity = true
+				break
+			}
 		}
-		for _, iss := range issues {
-			labels := make([]string, 0, len(iss.Labels))
-			hasComplexity := false
-			for _, l := range iss.Labels {
-				labels = append(labels, l.Name)
-				if strings.HasPrefix(l.Name, "complexity:") {
-					hasComplexity = true
-				}
-			}
-			// Per the plan: missing complexity:* → skip, don't default-route.
-			// The wildcard match: "*" profile catches everything otherwise,
-			// which would route un-triaged issues to the default model.
-			if !hasComplexity {
-				fmt.Printf("skip-issue: %s#%d reason=missing_complexity_label\n", iss.Repo, iss.Number)
-				continue
-			}
-			profile := cfg.MatchProfile(labels)
-			if profile == nil {
-				fmt.Printf("skip-issue: %s#%d reason=no_matching_profile labels=%v\n", iss.Repo, iss.Number, labels)
-				continue
-			}
-			return &iss, profile, nil
+		// Per the plan: missing complexity:* → skip, don't default-route.
+		// The wildcard match: "*" profile catches everything otherwise,
+		// which would route un-triaged issues to the default model.
+		if !hasComplexity {
+			fmt.Printf("skip-issue: %s reason=missing_complexity_label\n", iss.Identifier)
+			continue
 		}
+		profile := cfg.MatchProfile(iss.Labels)
+		if profile == nil {
+			fmt.Printf("skip-issue: %s reason=no_matching_profile labels=%v\n", iss.Identifier, iss.Labels)
+			continue
+		}
+		return &iss, profile, nil
 	}
 	return nil, nil, nil
 }
@@ -205,19 +218,28 @@ func worktreeBase(ctx context.Context, worktree string) (string, error) {
 	return ref, nil
 }
 
-func buildPRBody(iss *github.Issue, prof *config.Profile, res *executor.Result) string {
-	return fmt.Sprintf(`Closes %s#%d.
+// buildPRBody renders the PR description. For github tracker, includes
+// `Closes <repo>#N` so merge auto-closes the issue; for non-github, adds
+// a "Related to <identifier>" pointer with the source URL.
+func buildPRBody(kind string, iss *tracker.Issue, prof *config.Profile, res *executor.Result) string {
+	var ref string
+	if kind == "github" {
+		ref = fmt.Sprintf("Closes %s#%d.", iss.Repo, iss.Number)
+	} else {
+		ref = fmt.Sprintf("Related to %s (%s).", iss.Identifier, iss.URL)
+	}
+	return fmt.Sprintf(`%s
 
 %s
 
 ---
 
-<!-- gleaner: profile=%s plan=%s task_id=github:%s#%d branch=%s duration_ms=%d head_sha=%s -->
+<!-- gleaner: profile=%s plan=%s tracker=%s task_id=%s:%s branch=%s duration_ms=%d head_sha=%s -->
 *Opened by gleaner via profile* %s *(%s).*
 `,
-		iss.Repo, iss.Number,
+		ref,
 		iss.Title,
-		prof.Name, prof.Plan, iss.Repo, iss.Number, res.Branch, res.DurationMs, res.HeadSHA,
+		prof.Name, prof.Plan, kind, kind, iss.Identifier, res.Branch, res.DurationMs, res.HeadSHA,
 		prof.Name, strings.Join(prof.Run, " "),
 	)
 }

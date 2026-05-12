@@ -2,6 +2,12 @@
 // The user-facing surface is deliberately tiny: aggressive defaults absorb
 // timezone, hours, polling, require/block labels, plan, model flags, safety
 // caps, and `name` derivation. The user only writes what diverges.
+//
+// Milestone A adds the `tracker:` block (kind = github | linear) with
+// back-compat for the original top-level keys (`account`, `repos`,
+// `require`, `block`). When `tracker:` is present it takes precedence;
+// when only legacy keys are set, gleaner infers `tracker.kind: github`
+// and emits a one-line deprecation hint at Load() time.
 package config
 
 import (
@@ -14,15 +20,46 @@ import (
 )
 
 type Config struct {
-	Account  string    `yaml:"account"`
-	Repos    []string  `yaml:"repos"`
-	Require  []string  `yaml:"require"`
-	Block    []string  `yaml:"block"`
+	// Legacy top-level keys. Still honored; populated from cfg.Tracker
+	// after Load() so existing callers keep reading cfg.Account /
+	// cfg.Repos. New code should prefer cfg.Tracker.*.
+	Account string   `yaml:"account"`
+	Repos   []string `yaml:"repos"`
+	Require []string `yaml:"require"`
+	Block   []string `yaml:"block"`
+
+	// Tracker is the new, kind-aware tracker config. SPEC §5.3.
+	Tracker Tracker `yaml:"tracker"`
+
 	Hours    Hours     `yaml:"hours"`
 	Guards   Guards    `yaml:"guards"`
 	Profiles []Profile `yaml:"profiles"`
 	Hook     string    `yaml:"hook"`
 	Safety   Safety    `yaml:"safety"`
+}
+
+// Tracker mirrors the SPEC §5.3 `tracker` block. Kind selects the adapter;
+// each adapter consumes a subset of fields. Validation rejects fields that
+// don't apply to the active kind only when they conflict with required ones;
+// otherwise extra keys are tolerated for forward compatibility (per SPEC).
+type Tracker struct {
+	Kind string `yaml:"kind"` // "github" | "linear"
+
+	// GitHub-specific. When omitted at this level but the legacy top-level
+	// equivalents are set, Load() copies them in.
+	Account string   `yaml:"account"`
+	Repos   []string `yaml:"repos"`
+	Require []string `yaml:"require"`
+	Block   []string `yaml:"block"`
+
+	// Linear-specific.
+	APIKeyFile   string `yaml:"api_key_file"`
+	TeamKey      string `yaml:"team_key"`      // e.g. "MT" (issue prefix)
+	CodehostRepo string `yaml:"codehost_repo"` // owner/repo for PRs
+
+	// Shared (SPEC §5.3). Used by the orchestrator's reconciliation step.
+	ActiveStates   []string `yaml:"active_states"`
+	TerminalStates []string `yaml:"terminal_states"`
 }
 
 type Hours struct {
@@ -77,6 +114,10 @@ func Defaults() Config {
 	return Config{
 		Require: []string{"afk-ready"},
 		Block:   []string{"needs-human", "blocked", "wip"},
+		Tracker: Tracker{
+			ActiveStates:   []string{"open"},     // GitHub default; Linear users override
+			TerminalStates: []string{"closed"},   // GitHub default; Linear users override
+		},
 		Hours: Hours{
 			Active: "09:00-19:00",
 			Drain:  "22:00-07:00",
@@ -96,7 +137,11 @@ func Defaults() Config {
 	}
 }
 
-// Load reads a YAML file and overlays it onto Defaults().
+// Load reads a YAML file and overlays it onto Defaults(). After overlay,
+// Load reconciles the legacy top-level keys (`account`, `repos`,
+// `require`, `block`) with the new `tracker:` block: when tracker.kind is
+// unset and legacy fields are present, it backfills tracker as kind=github
+// and emits a deprecation hint to stderr.
 //
 // Overlay semantics: explicit user values override defaults; omitted keys
 // inherit defaults. Implementation uses a pointer-bearing overlay struct
@@ -117,6 +162,11 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
 	overlay.applyTo(&cfg)
+
+	// Reconcile legacy keys ↔ Tracker block.
+	if err := reconcileTracker(&cfg); err != nil {
+		return nil, err
+	}
 
 	// Derive profile names and plans where omitted.
 	for i := range cfg.Profiles {
@@ -144,19 +194,96 @@ func Load(path string) (*Config, error) {
 	return &cfg, nil
 }
 
+// reconcileTracker normalizes the relationship between cfg.Tracker and the
+// legacy top-level keys.
+//
+//   - If cfg.Tracker.Kind is set, it wins. Legacy keys are backfilled FROM
+//     the tracker block (so cfg.Account / cfg.Repos / cfg.Require / cfg.Block
+//     remain populated for legacy callers).
+//   - If cfg.Tracker.Kind is unset but legacy keys are set, infer kind=github
+//     and copy legacy → tracker. Print a one-line deprecation hint.
+//   - If neither is set, leave cfg.Tracker.Kind = "" — Validate will reject
+//     it later with a clear error.
+func reconcileTracker(cfg *Config) error {
+	t := &cfg.Tracker
+	hasLegacy := cfg.Account != "" || len(cfg.Repos) > 0
+	hasTracker := t.Kind != ""
+
+	if hasTracker && hasLegacy {
+		// Both set — tracker block wins, but warn so users don't silently
+		// edit the wrong one.
+		fmt.Fprintln(os.Stderr, "config: tracker.* and top-level account/repos both set; tracker.* takes precedence")
+	}
+
+	if hasTracker {
+		// Backfill legacy top-level from tracker block (for old callers).
+		switch t.Kind {
+		case "github":
+			if cfg.Account == "" {
+				cfg.Account = t.Account
+			}
+			if len(cfg.Repos) == 0 {
+				cfg.Repos = t.Repos
+			}
+			if len(cfg.Require) == 0 && len(t.Require) > 0 {
+				cfg.Require = t.Require
+			}
+			if len(cfg.Block) == 0 && len(t.Block) > 0 {
+				cfg.Block = t.Block
+			}
+		case "linear":
+			// linear doesn't populate the legacy github fields; that's OK,
+			// codehost callers will use cfg.Tracker.CodehostRepo.
+			if cfg.Account == "" {
+				cfg.Account = t.Account // operator may set explicitly for codehost auth
+			}
+		}
+		return nil
+	}
+
+	// No tracker block. Infer from legacy if possible.
+	if hasLegacy {
+		fmt.Fprintln(os.Stderr, "config: top-level account/repos are deprecated; please migrate to `tracker: {kind: github, ...}`")
+		t.Kind = "github"
+		t.Account = cfg.Account
+		t.Repos = cfg.Repos
+		if len(t.Require) == 0 {
+			t.Require = cfg.Require
+		}
+		if len(t.Block) == 0 {
+			t.Block = cfg.Block
+		}
+	}
+	return nil
+}
+
 // configOverlay mirrors Config with pointer-bearing scalars so the YAML
 // decoder leaves un-set fields as nil — distinguishing "user omitted" from
 // "user wrote 0". Each non-nil field is copied through to the merged Config.
 type configOverlay struct {
-	Account  *string             `yaml:"account"`
-	Repos    *[]string           `yaml:"repos"`
-	Require  *[]string           `yaml:"require"`
-	Block    *[]string           `yaml:"block"`
-	Hours    *hoursOverlay       `yaml:"hours"`
-	Guards   *guardsOverlay      `yaml:"guards"`
-	Profiles *[]Profile          `yaml:"profiles"`
-	Hook     *string             `yaml:"hook"`
-	Safety   *safetyOverlay      `yaml:"safety"`
+	Account  *string         `yaml:"account"`
+	Repos    *[]string       `yaml:"repos"`
+	Require  *[]string       `yaml:"require"`
+	Block    *[]string       `yaml:"block"`
+	Tracker  *trackerOverlay `yaml:"tracker"`
+	Hours    *hoursOverlay   `yaml:"hours"`
+	Guards   *guardsOverlay  `yaml:"guards"`
+	Profiles *[]Profile      `yaml:"profiles"`
+	Hook     *string         `yaml:"hook"`
+	Safety   *safetyOverlay  `yaml:"safety"`
+}
+
+type trackerOverlay struct {
+	Kind           *string   `yaml:"kind"`
+	Account        *string   `yaml:"account"`
+	Repos          *[]string `yaml:"repos"`
+	Require        *[]string `yaml:"require"`
+	Block          *[]string `yaml:"block"`
+	APIKeyFile     *string   `yaml:"api_key_file"`
+	TeamKey        *string   `yaml:"team_key"`
+	CodehostRepo   *string   `yaml:"codehost_repo"`
+	ActiveStates   *[]string `yaml:"active_states"`
+	TerminalStates *[]string `yaml:"terminal_states"`
 }
 
 type hoursOverlay struct {
@@ -190,6 +317,9 @@ func (ov *configOverlay) applyTo(base *Config) {
 	}
 	if ov.Block != nil {
 		base.Block = *ov.Block
+	}
+	if ov.Tracker != nil {
+		ov.Tracker.applyTo(&base.Tracker)
 	}
 	if ov.Hours != nil {
 		if ov.Hours.Active != nil {
@@ -232,6 +362,39 @@ func (ov *configOverlay) applyTo(base *Config) {
 		if ov.Safety.KillSwitch != nil {
 			base.Safety.KillSwitch = *ov.Safety.KillSwitch
 		}
+	}
+}
+
+func (ov *trackerOverlay) applyTo(base *Tracker) {
+	if ov.Kind != nil {
+		base.Kind = *ov.Kind
+	}
+	if ov.Account != nil {
+		base.Account = *ov.Account
+	}
+	if ov.Repos != nil {
+		base.Repos = *ov.Repos
+	}
+	if ov.Require != nil {
+		base.Require = *ov.Require
+	}
+	if ov.Block != nil {
+		base.Block = *ov.Block
+	}
+	if ov.APIKeyFile != nil {
+		base.APIKeyFile = *ov.APIKeyFile
+	}
+	if ov.TeamKey != nil {
+		base.TeamKey = *ov.TeamKey
+	}
+	if ov.CodehostRepo != nil {
+		base.CodehostRepo = *ov.CodehostRepo
+	}
+	if ov.ActiveStates != nil {
+		base.ActiveStates = *ov.ActiveStates
+	}
+	if ov.TerminalStates != nil {
+		base.TerminalStates = *ov.TerminalStates
 	}
 }
 
@@ -285,6 +448,30 @@ func (c *Config) Validate() error {
 		default:
 			return fmt.Errorf("config: profile %q: on_success must be open_pr | comment | none, got %q", p.Name, p.OnSuccess)
 		}
+	}
+	// Tracker validation.
+	switch c.Tracker.Kind {
+	case "":
+		return fmt.Errorf("config: tracker.kind is required (set `tracker: {kind: github, ...}` or legacy `account`/`repos` top-level)")
+	case "github":
+		if c.Tracker.Account == "" {
+			return fmt.Errorf("config: tracker.account is required for kind=github (e.g. nSimonFR-ai)")
+		}
+		if len(c.Tracker.Repos) == 0 {
+			return fmt.Errorf("config: tracker.repos must not be empty for kind=github")
+		}
+	case "linear":
+		if c.Tracker.APIKeyFile == "" {
+			return fmt.Errorf("config: tracker.api_key_file is required for kind=linear")
+		}
+		if c.Tracker.TeamKey == "" {
+			return fmt.Errorf("config: tracker.team_key is required for kind=linear (e.g. \"MT\")")
+		}
+		if c.Tracker.CodehostRepo == "" {
+			return fmt.Errorf("config: tracker.codehost_repo is required for kind=linear (where to open PRs)")
+		}
+	default:
+		return fmt.Errorf("config: tracker.kind %q is not supported (want github | linear)", c.Tracker.Kind)
 	}
 	return nil
 }
