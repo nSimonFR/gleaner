@@ -17,7 +17,7 @@
         let
           gleaner = pkgs.buildGoModule {
             pname = "gleaner";
-            version = "0.0.1";
+            version = "0.3.0";
             src = ./.;
             vendorHash = null; # vendored locally via `go mod vendor`
             subPackages = [ "cmd/gleaner" ];

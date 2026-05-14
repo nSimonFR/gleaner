@@ -1,68 +1,75 @@
 # gleaner
 
-A quota-aware coding-agent dispatcher. Drains a curated GitHub backlog into your
-idle hours so subscription tokens don't go to waste at week reset — without
-blocking your live work and without drowning you in PRs to review on Monday.
+A quota-gated cron dispatcher. Reads Claude + Codex utilization at zero
+token cost, evaluates a user-declared `when` predicate per trigger, and
+execs the matching `run` command. Drains idle hours into the
+subscription window without burning tokens to find out whether tokens
+are available.
 
-**Metric**: `merged_pr_equivalent_per_week`
+**Metric**: `useful_work_per_week`
 **Anti-goal**: `maximize_tokens_burned`
 
-> The name is the agricultural term for someone who picks up grain left in the
-> field after harvest. Value already paid for, recovered before it's plowed
-> under. See Millet's *The Gleaners* (1857) for the visual cue, or Agnès
-> Varda's *Les Glaneurs et la Glaneuse* (2000) for the modern reading.
+> The name is the agricultural term for someone who picks up grain left
+> in the field after harvest. Value already paid for, recovered before
+> it's plowed under. See Millet's *The Gleaners* (1857) for the visual
+> cue, or Agnès Varda's *Les Glaneurs et la Glaneuse* (2000) for the
+> modern reading.
 
 ---
 
 ## AI Installation Prompt
 
-> Install `gleaner` on a generic Linux or macOS host. **Done when** `gleaner snapshot` prints a non-empty utilization line for `claude` or `codex`.
+> Install `gleaner` on a generic Linux or macOS host. **Done when**
+> `gleaner snapshot` prints non-empty utilization for `claude` or
+> `codex`, and `gleaner tick --config gleaner.config.yaml --dry-run`
+> logs at least one `trigger_would_run` or `trigger_skipped` event.
 >
 > 1. Clone: `git clone https://github.com/nSimonFR/gleaner && cd gleaner`
-> 2. Read first: `README.md`, `go.mod`, `flake.nix`, `examples/` if present. Toolchain is Go ≥ 1.25.
-> 3. Build (try in this order, stop at the first that works):
+> 2. Read first: `README.md`, `go.mod`, `flake.nix`. Toolchain is Go ≥ 1.25.
+> 3. Build (try in order, stop at the first that works):
 >    - `nix build && cp result/bin/gleaner ~/.local/bin/`
 >    - `go build -o ~/.local/bin/gleaner ./cmd/gleaner`
->    Verify: `gleaner --help` lists `snapshot`, `drain`, `serve`, `bootstrap`.
+>    Verify: `gleaner --help` lists exactly `snapshot` and `tick`.
 > 4. Prerequisites for `snapshot` to return real data:
->    - Claude: `~/.claude/.credentials.json` exists with a fresh OAuth token (run `claude /login` once if missing).
->    - Codex: at least one session journal at `~/.codex/sessions/**/*.jsonl` (run `codex` once if missing).
-> 5. For daemon mode: write a `gleaner.config.yaml` (see the **Config** section below; the 7-line example is enough), then `gleaner serve --config gleaner.config.yaml`. NixOS hosts can use `services.gleaner` instead — see `module.nix`.
-> 6. Before any GitHub op against the user's repos, run `gh auth switch -u nSimonFR-ai` (the bot account, not the personal one).
+>    - Claude: `~/.claude/.credentials.json` exists with a fresh OAuth
+>      token (run `claude /login` once if missing).
+>    - Codex: at least one session journal at
+>      `~/.codex/sessions/**/*.jsonl` (run `codex` once if missing).
+> 5. For scheduled mode: write a `gleaner.config.yaml` (see **Config**
+>    below), then either run `gleaner tick` from your own cron/timer
+>    or, on NixOS, use the `services.gleaner` module from `module.nix`.
+> 6. Before any GitHub op against the user's repos, run
+>    `gh auth switch -u nSimonFR-ai` (the bot account, not the personal one).
 >
-> **Never invoke `claude` or `codex` as a subprocess to read quota** — gleaner does it for free via the journals, and shelling out burns tokens against the very window we're measuring.
+> **Never invoke `claude` or `codex` as a subprocess to read quota** —
+> gleaner does it for free via the journals, and shelling out burns
+> tokens against the very window we're measuring.
+
 ## Status
 
-**v0.0.3** — four subcommands ship; the daemon is deployed on the author's
-rpi5 as `services.gleaner`.
+**v0.3.0** — rescoped. Gleaner is now two subcommands:
 
 - `gleaner snapshot` — print both providers' quota at zero token cost.
-- `gleaner drain --config <yaml>` — single-shot dispatch (predicate →
-  one issue → one PR labeled `afk` + `needs-review`).
-- `gleaner serve --config <yaml>` — long-running daemon for non-systemd
-  setups. The NixOS module uses timer-fires-drain instead; `serve` is
-  for testing or other init systems.
-- `gleaner bootstrap --config <yaml>` — idempotent label creation
-  (`afk-ready`, `complexity:{trivial,routine,hard}`, `needs-human`,
-  `blocked`, `wip`, `afk`, `needs-review`).
+- `gleaner tick --config <yaml>` — one-shot trigger evaluator. Reads
+  the snapshot, evaluates each trigger's `when` expression, execs the
+  matching ones. Stateless. Designed for a systemd timer.
 
-Next: HTTP `/status` for a homepage widget (v0.0.4); a worked Codex
-executor profile (v0.0.5; the executor already supports it). Everything
-deferred past v0.0.5 lives in [IDEAS.md](./IDEAS.md).
+The pre-0.3 orchestrator (worktrees, hooks, executor, Linear/GitHub
+trackers, ranking, PR opener) has been removed — that work belongs in
+whatever the user puts in `run`. Typically a `claude -p "…"` or `codex
+run "…"` invocation that leans on a vendored skill (e.g. the `linear`
+skill ships in `nic-os` at `shared/skills/linear/`).
 
 ## The design claim
 
 Both Claude Code and Codex CLI already expose usable utilization at zero
-token cost. Gleaner's load-bearing innovation is **reading the journals
-the CLIs already write**, never invoking them as subprocesses.
+token cost. Gleaner's only load-bearing innovation is **reading the
+journals the CLIs already write**, never invoking them as subprocesses.
 
 | Provider | Source                                            | Cost     | Notes                                                            |
 |----------|---------------------------------------------------|----------|------------------------------------------------------------------|
 | Claude   | `https://api.anthropic.com/api/oauth/usage`        | 0 tokens | OAuth metadata endpoint; does not draw quota. Needs `~/.claude/.credentials.json`. |
 | Codex    | `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`     | 0 tokens | `event_msg.payload.type=="token_count"` events; Codex pre-computes `used_percent`. |
-
-Validating that one `QuotaSource` interface fits both providers cleanly
-was v0.0.1's acceptance test for the multi-provider premise. It did.
 
 ## Quickstart
 
@@ -70,134 +77,122 @@ was v0.0.1's acceptance test for the multi-provider premise. It did.
 nix build && ./result/bin/gleaner snapshot
 ```
 
-or with a Go 1.25+ toolchain:
-
-```
-go build -o gleaner ./cmd/gleaner && ./gleaner snapshot
-```
-
 ```
 $ gleaner snapshot
 claude (max_5x)   [source: /api/oauth/usage]:
   short   83.0%   resets in 0h 12m
   long    44.0%   resets in 14h 23m
-  sub-buckets: omelette  0.0% / sonnet  0.0% /
-
-codex (plus)   [source: rollout-2026-05-10T14-34-49-019e11e2.jsonl]:
+codex (plus)   [source: rollout-2026-05-14T14-34-49.jsonl]:
   short    1.0%   resets in 4h 15m
   long     0.0%   resets in 6d 18h
 ```
 
-`snapshot` needs no config. `drain`, `serve`, `bootstrap` take `--config <yaml>`.
+`snapshot` needs no config. `tick` takes `--config <yaml>`.
 
 ## Config
 
-The user-facing surface is deliberately tiny: aggressive package
-defaults absorb timezone, hours, polling, label sets, guard
-thresholds, safety caps, profile names, and plan inference. Users
-write only what diverges.
-
 ```yaml
-# gleaner.config.yaml — minimum useful deployment config
-account: nSimonFR-ai
-repos:   [nSimonFR/nic-os, nSimonFR/for-sure]
-
-profiles:
-  - { match: ["lang:python", "provider:codex"], run: ["codex", "exec", "{prompt}"] }
-  - { match: "*",                                run: ["claude", "-p", "{prompt}"] }
-
-hook: /etc/gleaner/hooks/dispatch.sh
+triggers:
+  - name: cyrus-handoff
+    when: "claude.long_pct < 50 && codex.short_pct < 80"
+    timeout: 10m
+    env:
+      LINEAR_KEY_FILE: /run/agenix/linear-key
+    run:
+      - claude
+      - -p
+      - "Pick the next NSI ticket labelled cyrus-ready (oldest first), assign it to the cyrus user, and post a one-line ack comment. Use the linear skill. Quit immediately after."
 ```
 
-- `match` — string or list of GitHub label names. The literal `"*"`
-  matches everything. **First match wins.**
-- `run` — argv list; **no shell**, so issue titles can't inject. Template
-  variables are substituted in each element: `{prompt}`, `{worktree}`,
-  `{repo}`, `{issue_title}`, `{issue_body}`, `{issue_number}`. The same
-  values are also exported as `GLEANER_PROMPT`, `GLEANER_WORKTREE`,
-  `GLEANER_REPO`, `GLEANER_ISSUE` in the child env.
-- `on_success` — one of `open_pr` (default), `comment`, `none`. Only
-  `open_pr` pushes the branch and calls `gh pr create`.
-- `hook` — optional path to a script gleaner fork-execs on lifecycle
-  events (`pr_opened`, `dispatch_failed`, …). Event name is `$1`,
-  JSON payload arrives on stdin. Hook failures are logged, never block.
+Top-level: a list of `triggers`. Each trigger:
 
-Issues missing a `complexity:*` label are skipped on purpose — the
-`"*"` profile must not silently route un-triaged work to the default
-model. Run `gleaner bootstrap` to create the label set.
+| field    | meaning                                                                       |
+|----------|-------------------------------------------------------------------------------|
+| `name`   | required, unique within the config; used in log lines and `--only`            |
+| `when`   | required; quota expression (see grammar below)                                |
+| `run`    | required; argv. `run[0]` is the command, the rest are args                    |
+| `timeout`| optional; Go duration (default `5m`)                                          |
+| `env`    | optional; extra env merged on top of the parent (overrides on collision)      |
 
-## Architecture
-
-Stateless by design. GitHub is the source of truth for inflight count,
-daily count, label state, and merge history.
+### `when` expression grammar
 
 ```
-  timer → drain
-    ├── predicate (internal/predicate)
-    │     kill-switch → hours → quota windows → inflight PRs → daily cap
-    │     each QuotaSource snapshots short + long; ceilings differ by hour
-    ├── pickIssue (internal/adapter/github)
-    │     walk repos, require/block labels, skip missing complexity:*,
-    │     MatchProfile() over labels (first match wins)
-    ├── executor.Run (internal/executor)
-    │     git worktree add → template-sub {prompt}/{worktree}/… →
-    │     exec profile.run → status --porcelain
-    └── PR opener
-          push branch → gh pr create with [afk, needs-review]
-          → hook.Fire("pr_opened", …) best-effort
+expr  := and ('||' and)*
+and   := cmp  ('&&' cmp )*
+cmp   := atom OP atom        OP ∈ {<, <=, >, >=, ==, !=}
+atom  := ident | number | bool
+ident := <provider>.<field>
 ```
 
-`serve` wraps the same `drain` machinery in a `time.Ticker` loop —
-identical evaluation, longer-lived process. Layout:
+Identifiers resolved against the live snapshot:
 
-- `cmd/gleaner/` — `snapshot`, `drain`, `serve`, `bootstrap`
-- `internal/adapter/{quota,claude_oauth,codex_journal,github}/`
-- `internal/{config,predicate,executor,hook}/`
-- `flake.nix` + `module.nix`
+| ident                  | value                                          |
+|------------------------|------------------------------------------------|
+| `claude.short_pct`     | `windows.short.used_percent × 100`             |
+| `claude.long_pct`      | `windows.long.used_percent × 100`              |
+| `claude.extra_usage`   | `extra_usage_enabled` (bool)                   |
+| `claude.ok`            | snapshot fetched without error (bool)          |
+| `codex.short_pct`      | same                                           |
+| `codex.long_pct`       | same                                           |
+| `codex.extra_usage`    | same                                           |
+| `codex.ok`             | same                                           |
 
----
+A provider whose snapshot failed gets `*.ok = false` and
+`*_pct = +Inf`, so `<` predicates naturally exclude it.
 
-## NixOS module
+Anything fancier than this grammar belongs in your `run` command, not
+here.
+
+## NixOS
 
 ```nix
 {
-  inputs.gleaner.url = "github:nSimonFR-ai/gleaner";
-
-  outputs = { self, nixpkgs, gleaner, ... }: {
-    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
-      modules = [
-        gleaner.nixosModules.gleaner
-        ({
-          services.gleaner = {
-            enable     = true;
-            user       = "nsimon";              # must own ~/.claude and ~/.codex
-            configFile = ./gleaner.config.yaml; # the YAML above
-            # workTreeRoot = "/var/lib/gleaner/worktrees";  # default
-            # timer.onUnitActiveSec = "10min";              # default
-            # timer.onBootSec       = "2min";               # default
-          };
-        })
-      ];
-    };
+  imports = [ gleaner.nixosModules.gleaner ];
+  services.gleaner = {
+    enable = true;
+    user = "nsimon";
+    configFile = ./gleaner.config.yaml;
+    timer.onUnitActiveSec = "10min";
   };
 }
 ```
 
-The module ships `gleaner.service` (Type=oneshot, runs `gleaner drain
---config <configFile>`) plus `gleaner.timer` (`Persistent=true`).
-`ProtectHome` is off because gleaner must read the operator user's
-`~/.claude/.credentials.json` and `~/.codex/sessions/`. The configured
-`user` is intentionally a real human user — gleaner reads *that user's*
-quota journals.
+The unit's environment doesn't carry trigger secrets — pass those via
+each trigger's `env:` block so they live in your YAML next to the
+command that needs them.
 
----
+## Tick flow
 
-## See also
+```
+gleaner tick --config gleaner.config.yaml [--dry-run] [--only NAME]
+```
 
-- [IDEAS.md](./IDEAS.md) — explicitly deferred past v0.0.5: extra
-  executor profiles, hook recipes, auto-merge, quota optimization,
-  observability extensions, routing.
+1. Load config. Empty `triggers` list → exit 0 with a log line.
+2. Fetch snapshots from both providers in parallel.
+3. For each trigger (in order):
+   - Evaluate `when`. Parse / type error → log `trigger_parse_error`, skip.
+   - False → log `trigger_skipped`.
+   - True + `--dry-run` → log `trigger_would_run`.
+   - True otherwise → exec `run` with the merged env and timeout. Log
+     `trigger_ok` on success or `trigger_failed` (with truncated
+     stderr) on non-zero exit / timeout.
+4. Exit 0 even if some triggers failed — one bad trigger should never
+   wedge the timer.
 
-## License
+Triggers run sequentially within a tick. There is no shared state
+between ticks; if a trigger needs to dedup or rate-limit itself, push
+that into the `run` command (the skills that talk to Linear/GitHub
+already do this).
 
-MIT.
+## Logs
+
+All output is on stderr in `event=value key=value …` format:
+
+```
+event=snapshot_ok provider=claude short_pct=83.0 long_pct=44.0
+event=snapshot_ok provider=codex short_pct=1.0 long_pct=0.0
+event=trigger_skipped name=cyrus-handoff reason=when_false
+event=trigger_ok name=other duration_ms=482 stdout_bytes=120
+```
+
+Read with `journalctl -u gleaner.service -f`.
