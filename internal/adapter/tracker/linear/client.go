@@ -1,14 +1,13 @@
 // Package linear implements the tracker.Tracker interface against Linear
-// via GraphQL. The orchestrator filters issues by configured active_states
-// (default: "Todo", "In Progress") and the configured team key (e.g. "MT").
+// via GraphQL.
 //
 // Auth: Linear API key (`lin_api_...`) loaded from a file path. The
 // `Authorization` header carries the key directly — no "Bearer" prefix
 // per Linear's docs.
 //
-// Code lives on GitHub regardless of tracker: the github codehost still
-// opens PRs. Comment() writes back to the Linear issue ("PR opened: <url>")
-// so the operator sees the result on the Linear board.
+// Gleaner uses this adapter as a picker only: ListActive reads candidates,
+// Assign hands one off to Cyrus by changing the assignee. Lifecycle
+// (comments, state moves, PRs) is Cyrus's job.
 package linear
 
 import (
@@ -31,17 +30,16 @@ type Client struct {
 	Endpoint     string        // override for tests; defaults to api.linear.app
 	APIKey       string        // raw key (use APIKeyFile in production)
 	APIKeyFile   string        // path read once at EnforceAuth and cached
-	TeamKey      string        // e.g. "MT" (prefix of identifiers like MT-649)
+	TeamKey      string        // e.g. "NSI" (prefix of identifiers like NSI-18)
 	ActiveStates []string      // Linear state names, e.g. ["Todo", "In Progress"]
-	CodehostRepo string        // owner/repo — fills Issue.Repo (Linear has no native repo concept)
 	Timeout      time.Duration // per HTTP request; defaults to 15s
 	httpClient   *http.Client
 }
 
 // New constructs a linear tracker. APIKey and APIKeyFile are mutually
-// exclusive; provide one. TeamKey is required. ActiveStates defaults
-// to ["Todo", "In Progress"] when empty (matches Symphony SPEC §5.3).
-func New(apiKeyFile, teamKey, codehostRepo string, activeStates []string) *Client {
+// exclusive; provide one. TeamKey is required. ActiveStates defaults to
+// ["Todo", "In Progress"] when empty.
+func New(apiKeyFile, teamKey string, activeStates []string) *Client {
 	if len(activeStates) == 0 {
 		activeStates = []string{"Todo", "In Progress"}
 	}
@@ -50,18 +48,15 @@ func New(apiKeyFile, teamKey, codehostRepo string, activeStates []string) *Clien
 		APIKeyFile:   apiKeyFile,
 		TeamKey:      teamKey,
 		ActiveStates: activeStates,
-		CodehostRepo: codehostRepo,
 		Timeout:      15 * time.Second,
 		httpClient:   &http.Client{Timeout: 15 * time.Second},
 	}
 }
 
-// Kind returns "linear". Used for session_id prefix (SPEC §13.1).
+// Kind returns "linear".
 func (c *Client) Kind() string { return "linear" }
 
-// EnforceAuth loads the API key (if APIKeyFile is set) and issues a
-// minimal GraphQL ping (`viewer { id }`) to validate it. Run once at
-// startup.
+// EnforceAuth loads the API key and issues a viewer ping to validate it.
 func (c *Client) EnforceAuth(ctx context.Context) error {
 	if err := c.loadKey(); err != nil {
 		return err
@@ -100,30 +95,29 @@ func (c *Client) loadKey() error {
 	return nil
 }
 
-// gqlIssueNode mirrors the fields requested in the ListActive query.
 type gqlIssueNode struct {
 	ID          string `json:"id"`
 	Identifier  string `json:"identifier"`
 	Title       string `json:"title"`
 	Description string `json:"description"`
-	BranchName  string `json:"branchName"`
 	URL         string `json:"url"`
 	Priority    int    `json:"priority"`
 	State       struct {
 		Name string `json:"name"`
 		Type string `json:"type"`
 	} `json:"state"`
+	Assignee *struct {
+		ID string `json:"id"`
+	} `json:"assignee"`
 	Labels struct {
 		Nodes []struct {
 			Name string `json:"name"`
 		} `json:"nodes"`
 	} `json:"labels"`
 	// inverseRelations on issue X = "relations where X is the target".
-	// For relation type "blocks", that means "issues that block X" —
-	// the actual blockers. Querying `relations` would return the
-	// inverse (issues X blocks), which is the wrong direction for
-	// SPEC §8.1 step 5 (Todo issues with non-terminal blockers are
-	// ineligible). Matches Symphony Elixir's linear/client.ex shape.
+	// For relation type "blocks", that means "issues that block X" — the
+	// actual blockers. Querying `relations` would return the opposite
+	// direction (issues X blocks).
 	InverseRelations struct {
 		Nodes []struct {
 			Type  string `json:"type"`
@@ -140,15 +134,13 @@ type gqlIssueNode struct {
 }
 
 // ListActive returns issues whose state name is in c.ActiveStates and whose
-// team key matches c.TeamKey. SPEC §8.1 step 3.
-//
-// Order: most-recently-updated-first (Linear default). Orchestrator re-sorts.
+// team key matches c.TeamKey.
 func (c *Client) ListActive(ctx context.Context) ([]tracker.Issue, error) {
 	if err := c.loadKey(); err != nil {
 		return nil, err
 	}
 	if c.TeamKey == "" {
-		return nil, fmt.Errorf("linear tracker: TeamKey is required (e.g. \"MT\")")
+		return nil, fmt.Errorf("linear tracker: TeamKey is required (e.g. \"NSI\")")
 	}
 	const q = `query($team: String!, $states: [String!]) {
 		issues(
@@ -159,8 +151,9 @@ func (c *Client) ListActive(ctx context.Context) ([]tracker.Issue, error) {
 			}
 		) {
 			nodes {
-				id identifier title description branchName url priority
+				id identifier title description url priority
 				state { name type }
+				assignee { id }
 				labels { nodes { name } }
 				inverseRelations { nodes { type issue { id state { type } } } }
 				createdAt updatedAt
@@ -178,36 +171,29 @@ func (c *Client) ListActive(ctx context.Context) ([]tracker.Issue, error) {
 	}
 	out := make([]tracker.Issue, 0, len(resp.Issues.Nodes))
 	for _, n := range resp.Issues.Nodes {
-		// Labels lower-cased to match gleaner's profile-matching convention.
-		// GitHub labels are conventionally lowercase; Linear lets operators
-		// store mixed case. cfg.MatchProfile is case-insensitive, but
-		// lowercasing here gives a single canonical form in logs and the
-		// /status JSON (Milestone E). Matches Symphony Elixir's
-		// linear/client.ex:extract_labels.
 		labels := make([]string, 0, len(n.Labels.Nodes))
 		for _, l := range n.Labels.Nodes {
 			labels = append(labels, strings.ToLower(l.Name))
 		}
-		// SPEC §8.1 step 5: Todo issues with non-terminal blockers are
-		// ineligible. inverseRelations on this issue = "relations where
-		// this issue is the target" — for type="blocks", the source is
-		// the actual blocker.
 		var blockedBy []string
 		for _, r := range n.InverseRelations.Nodes {
 			if r.Type == "blocks" && r.Issue.State.Type != "completed" && r.Issue.State.Type != "canceled" {
 				blockedBy = append(blockedBy, r.Issue.ID)
 			}
 		}
+		var assigneeID string
+		if n.Assignee != nil {
+			assigneeID = n.Assignee.ID
+		}
 		out = append(out, tracker.Issue{
 			ID:         n.ID,
 			Identifier: n.Identifier,
-			Repo:       c.CodehostRepo,
 			Title:      n.Title,
 			Body:       n.Description,
 			Labels:     labels,
 			State:      n.State.Name,
 			Priority:   n.Priority,
-			BranchName: n.BranchName,
+			AssigneeID: assigneeID,
 			URL:        n.URL,
 			BlockedBy:  blockedBy,
 			CreatedAt:  n.CreatedAt,
@@ -217,47 +203,28 @@ func (c *Client) ListActive(ctx context.Context) ([]tracker.Issue, error) {
 	return out, nil
 }
 
-// GetState fetches the current state name for a single issue. SPEC §8.1 Part B.
-func (c *Client) GetState(ctx context.Context, issueID string) (string, error) {
-	if err := c.loadKey(); err != nil {
-		return "", err
-	}
-	const q = `query($id: String!) { issue(id: $id) { state { name } } }`
-	var resp struct {
-		Issue struct {
-			State struct {
-				Name string `json:"name"`
-			} `json:"state"`
-		} `json:"issue"`
-	}
-	if err := c.query(ctx, q, map[string]any{"id": issueID}, &resp); err != nil {
-		return "", err
-	}
-	return resp.Issue.State.Name, nil
-}
-
-// Comment writes a comment to the Linear issue. The orchestrator uses this
-// to post the resulting GitHub PR URL back so the Linear board reflects it.
-func (c *Client) Comment(ctx context.Context, issueID, body string) error {
+// Assign sets the assignee on the given issue. When userID matches the
+// Cyrus agent user, Linear fires an "Agent session event" webhook to
+// cyrus.service — that's the picker handoff path.
+func (c *Client) Assign(ctx context.Context, issueID, userID string) error {
 	if err := c.loadKey(); err != nil {
 		return err
 	}
-	const q = `mutation($id: String!, $body: String!) {
-		commentCreate(input: { issueId: $id, body: $body }) {
+	const q = `mutation($id: String!, $assignee: String!) {
+		issueUpdate(id: $id, input: { assigneeId: $assignee }) {
 			success
-			comment { id }
 		}
 	}`
 	var resp struct {
-		CommentCreate struct {
+		IssueUpdate struct {
 			Success bool `json:"success"`
-		} `json:"commentCreate"`
+		} `json:"issueUpdate"`
 	}
-	if err := c.query(ctx, q, map[string]any{"id": issueID, "body": body}, &resp); err != nil {
+	if err := c.query(ctx, q, map[string]any{"id": issueID, "assignee": userID}, &resp); err != nil {
 		return err
 	}
-	if !resp.CommentCreate.Success {
-		return fmt.Errorf("linear tracker: commentCreate returned success=false for issue %s", issueID)
+	if !resp.IssueUpdate.Success {
+		return fmt.Errorf("linear tracker: issueUpdate returned success=false for issue %s", issueID)
 	}
 	return nil
 }

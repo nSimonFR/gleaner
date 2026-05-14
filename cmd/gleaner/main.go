@@ -1,6 +1,6 @@
-// Gleaner is a quota-aware coding-agent dispatcher.
-// v0.0.1 ships the `snapshot` subcommand only — it reads each provider's
-// canonical, zero-cost quota source and prints utilization.
+// Gleaner is a quota-aware Linear ticket picker that hands tickets off
+// to Cyrus by reassigning them. It does not execute coding agents itself
+// — Cyrus listens for Linear Agent session events and does the work.
 package main
 
 import (
@@ -11,7 +11,7 @@ import (
 	"syscall"
 )
 
-const version = "0.0.1"
+const version = "0.2.0"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -26,12 +26,8 @@ func main() {
 	switch cmd {
 	case "snapshot":
 		os.Exit(snapshotCmd(ctx, args))
-	case "drain":
-		os.Exit(drainCmd(ctx, args))
-	case "serve":
-		os.Exit(serveCmd(ctx, args))
-	case "bootstrap":
-		os.Exit(bootstrapCmd(ctx, args))
+	case "tick":
+		os.Exit(tickCmd(ctx, args))
 	case "version", "--version", "-v":
 		fmt.Println("gleaner", version)
 	case "help", "-h", "--help":
@@ -44,18 +40,14 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `gleaner %s — quota-aware coding-agent dispatcher
+	fmt.Fprintf(os.Stderr, `gleaner %s — quota-aware Linear ticket picker
 
 usage:
   gleaner snapshot [--json]            print current quota utilization
-  gleaner drain --config <yaml> [--dry-run]
-                                       evaluate predicate; if it passes,
-                                       dispatch one issue and open one PR.
-                                       Single-shot in v0.0.2.
-  gleaner serve --config <yaml>        long-running daemon. polls every
-                                       hours.poll, runs drain on each tick.
-  gleaner bootstrap --config <yaml>    create the 9 gleaner labels on each
-                                       configured repo (idempotent).
+  gleaner tick --config <yaml> [--dry-run]
+                                       run one picker pass: read Linear,
+                                       check quota, hand off top candidate
+                                       to Cyrus via assignment. Idempotent.
   gleaner version
   gleaner help
 `, version)

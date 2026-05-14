@@ -6,7 +6,7 @@ let
   inherit (lib) mkEnableOption mkOption mkIf types;
 in {
   options.services.gleaner = {
-    enable = mkEnableOption "gleaner — quota-aware coding-agent dispatcher";
+    enable = mkEnableOption "gleaner — quota-aware Linear ticket picker for Cyrus";
 
     package = mkOption {
       type = types.package;
@@ -32,17 +32,11 @@ in {
       example = "./gleaner.config.yaml";
     };
 
-    workTreeRoot = mkOption {
-      type = types.str;
-      default = "/var/lib/gleaner/worktrees";
-      description = "Where gleaner creates per-task git worktrees.";
-    };
-
     timer = {
       onUnitActiveSec = mkOption {
         type = types.str;
         default = "10min";
-        description = "How often to evaluate the predicate.";
+        description = "How often to run a picker tick.";
       };
       onBootSec = mkOption {
         type = types.str;
@@ -59,7 +53,7 @@ in {
 
   config = mkIf cfg.enable {
     systemd.services.gleaner = {
-      description = "Gleaner — one-shot dispatch evaluation";
+      description = "Gleaner — one-shot picker tick";
       wantedBy = [ ]; # triggered by .timer, not at boot
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
@@ -67,24 +61,20 @@ in {
       serviceConfig = {
         Type = "oneshot";
         User = cfg.user;
-        ExecStart = "${cfg.package}/bin/gleaner drain --config ${cfg.configFile} --worktree-root ${cfg.workTreeRoot}";
-        # Lock the dispatcher so two ticks can't overlap on a slow run.
+        ExecStart = "${cfg.package}/bin/gleaner tick --config ${cfg.configFile}";
         RuntimeDirectory = "gleaner";
         StateDirectory = "gleaner";
-        # Soft hardening — gleaner needs read access to user's HOME for journals.
+        # Soft hardening — gleaner needs read access to user's HOME for quota journals.
         ProtectSystem = "strict";
         ProtectHome = false;
         ProtectKernelTunables = true;
         ProtectKernelModules = true;
         NoNewPrivileges = true;
-        # Gleaner shells out to `gh`, `git`, and the configured executor — keep PATH usable.
       };
-
-      path = [ pkgs.git pkgs.gh ];
     };
 
     systemd.timers.gleaner = {
-      description = "Gleaner — poll predicate every ${cfg.timer.onUnitActiveSec}";
+      description = "Gleaner — run a picker tick every ${cfg.timer.onUnitActiveSec}";
       wantedBy = [ "timers.target" ];
       timerConfig = {
         OnBootSec = cfg.timer.onBootSec;

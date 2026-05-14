@@ -1,5 +1,5 @@
 {
-  description = "gleaner — a quota-aware coding-agent dispatcher";
+  description = "gleaner — a quota-aware Linear ticket picker for Cyrus";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -17,13 +17,13 @@
         let
           gleaner = pkgs.buildGoModule {
             pname = "gleaner";
-            version = "0.0.1";
+            version = "0.2.0";
             src = ./.;
             vendorHash = null; # vendored locally via `go mod vendor`
             subPackages = [ "cmd/gleaner" ];
             ldflags = [ "-s" "-w" ];
             meta = with pkgs.lib; {
-              description = "Quota-aware coding-agent dispatcher";
+              description = "Quota-aware Linear ticket picker for Cyrus";
               homepage = "https://github.com/nSimonFR/gleaner";
               license = licenses.mit;
               mainProgram = "gleaner";

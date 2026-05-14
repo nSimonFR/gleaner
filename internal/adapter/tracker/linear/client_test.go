@@ -15,8 +15,6 @@ import (
 	"testing"
 )
 
-// fakeLinear records the last request body and dispatches a response
-// from `responses` keyed by a substring of the query.
 type fakeLinear struct {
 	t            *testing.T
 	lastBody     string
@@ -49,9 +47,8 @@ func newClient(t *testing.T, srv *httptest.Server) *Client {
 	return &Client{
 		Endpoint:     srv.URL,
 		APIKey:       "lin_api_testkey",
-		TeamKey:      "MT",
+		TeamKey:      "NSI",
 		ActiveStates: []string{"Todo", "In Progress"},
-		CodehostRepo: "nSimonFR/test-repo",
 		httpClient:   srv.Client(),
 	}
 }
@@ -70,7 +67,6 @@ func TestEnforceAuth(t *testing.T) {
 	if err := c.EnforceAuth(context.Background()); err != nil {
 		t.Fatalf("EnforceAuth: %v", err)
 	}
-	// Auth header must be the raw key, no "Bearer" prefix (Linear convention).
 	if fake.lastAuth != "lin_api_testkey" {
 		t.Errorf("Authorization = %q; want raw key (no Bearer prefix)", fake.lastAuth)
 	}
@@ -97,9 +93,7 @@ func TestEnforceAuth_BadKey(t *testing.T) {
 }
 
 // TestListActive_QueryShape is the regression guard for the
-// `relations` vs `inverseRelations` bug class. It asserts the GraphQL
-// query our client emits contains the exact correct field names —
-// `inverseRelations` with `issue` (not `relations` with `relatedIssue`).
+// `relations` vs `inverseRelations` bug class.
 func TestListActive_QueryShape(t *testing.T) {
 	fake := &fakeLinear{
 		t: t,
@@ -115,32 +109,29 @@ func TestListActive_QueryShape(t *testing.T) {
 		t.Fatalf("ListActive: %v", err)
 	}
 
-	// The query must use inverseRelations { issue } to fetch blockers.
-	// `relations { relatedIssue }` would return the opposite direction
-	// (issues this one blocks, not blockers).
 	if !strings.Contains(fake.lastBody, "inverseRelations") {
 		t.Errorf("query missing inverseRelations field; body:\n%s", fake.lastBody)
 	}
-	if strings.Contains(fake.lastBody, "relations { nodes { type relatedIssue") {
-		t.Errorf("query uses wrong-direction `relations { relatedIssue }`; should be `inverseRelations { issue }`")
+	if !strings.Contains(fake.lastBody, "assignee") {
+		t.Errorf("query must request assignee for picker filter; body:\n%s", fake.lastBody)
 	}
-	// Sanity: the filter shape must include team key + state name.
-	for _, needle := range []string{"team:", "state:", `"team":"MT"`, `"Todo"`, `"In Progress"`} {
+	if strings.Contains(fake.lastBody, "relations { nodes { type relatedIssue") {
+		t.Errorf("query uses wrong-direction `relations { relatedIssue }`")
+	}
+	for _, needle := range []string{"team:", "state:", `"team":"NSI"`, `"Todo"`, `"In Progress"`} {
 		if !strings.Contains(fake.lastBody, needle) {
 			t.Errorf("query/vars missing %q; body:\n%s", needle, fake.lastBody)
 		}
 	}
 }
 
-// TestListActive_BlockerSemantics verifies that an issue is marked
-// BlockedBy when an inverseRelations entry of type "blocks" points to a
-// related issue whose state.type is neither "completed" nor "canceled".
-func TestListActive_BlockerSemantics(t *testing.T) {
+func TestListActive_BlockerAndAssignee(t *testing.T) {
 	resp := `{"data":{"issues":{"nodes":[
 		{
-			"id":"i1","identifier":"MT-1","title":"a","description":"",
-			"branchName":"","url":"","priority":0,
+			"id":"i1","identifier":"NSI-1","title":"a","description":"",
+			"url":"","priority":2,
 			"state":{"name":"Todo","type":"unstarted"},
+			"assignee":{"id":"user_cyrus"},
 			"labels":{"nodes":[{"name":"Complexity:Routine"}]},
 			"inverseRelations":{"nodes":[
 				{"type":"blocks","issue":{"id":"blocker1","state":{"type":"started"}}},
@@ -148,6 +139,15 @@ func TestListActive_BlockerSemantics(t *testing.T) {
 				{"type":"duplicate","issue":{"id":"dup","state":{"type":"started"}}}
 			]},
 			"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-01T00:00:00Z"
+		},
+		{
+			"id":"i2","identifier":"NSI-2","title":"b","description":"",
+			"url":"","priority":0,
+			"state":{"name":"Todo","type":"unstarted"},
+			"assignee":null,
+			"labels":{"nodes":[]},
+			"inverseRelations":{"nodes":[]},
+			"createdAt":"2026-01-02T00:00:00Z","updatedAt":"2026-01-02T00:00:00Z"
 		}
 	]}}}`
 	fake := &fakeLinear{t: t, responsesFor: map[string]string{"issues(": resp}}
@@ -159,83 +159,56 @@ func TestListActive_BlockerSemantics(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListActive: %v", err)
 	}
-	if len(issues) != 1 {
-		t.Fatalf("got %d issues, want 1", len(issues))
+	if len(issues) != 2 {
+		t.Fatalf("got %d issues, want 2", len(issues))
 	}
-	iss := issues[0]
-	if iss.ID != "i1" || iss.Identifier != "MT-1" {
-		t.Errorf("issue id/identifier = %q/%q", iss.ID, iss.Identifier)
+	if issues[0].AssigneeID != "user_cyrus" {
+		t.Errorf("issue0 AssigneeID = %q; want user_cyrus", issues[0].AssigneeID)
 	}
-	// Only the active "blocks" relation should count. The completed
-	// blocker is filtered; the "duplicate" relation is the wrong type.
-	if len(iss.BlockedBy) != 1 || iss.BlockedBy[0] != "blocker1" {
-		t.Errorf("BlockedBy = %v; want [blocker1]", iss.BlockedBy)
+	if issues[1].AssigneeID != "" {
+		t.Errorf("issue1 AssigneeID = %q; want empty (unassigned)", issues[1].AssigneeID)
 	}
-	// Labels should be lower-cased per gleaner convention.
-	if len(iss.Labels) != 1 || iss.Labels[0] != "complexity:routine" {
-		t.Errorf("Labels = %v; want [complexity:routine]", iss.Labels)
+	if len(issues[0].BlockedBy) != 1 || issues[0].BlockedBy[0] != "blocker1" {
+		t.Errorf("issue0 BlockedBy = %v; want [blocker1]", issues[0].BlockedBy)
 	}
-	// CodehostRepo should be backfilled from client config.
-	if iss.Repo != "nSimonFR/test-repo" {
-		t.Errorf("Repo = %q; want nSimonFR/test-repo", iss.Repo)
+	if len(issues[0].Labels) != 1 || issues[0].Labels[0] != "complexity:routine" {
+		t.Errorf("issue0 Labels = %v; want [complexity:routine]", issues[0].Labels)
 	}
 }
 
-func TestGetState(t *testing.T) {
+func TestAssign(t *testing.T) {
 	fake := &fakeLinear{
 		t: t,
 		responsesFor: map[string]string{
-			"issue(id:":   `{"data":{"issue":{"state":{"name":"Done"}}}}`,
-			`"id":"abc"`:  `{"data":{"issue":{"state":{"name":"Done"}}}}`,
+			"issueUpdate": `{"data":{"issueUpdate":{"success":true}}}`,
 		},
 	}
 	srv := httptest.NewServer(fake.handler())
 	defer srv.Close()
 
 	c := newClient(t, srv)
-	state, err := c.GetState(context.Background(), "abc")
-	if err != nil {
-		t.Fatalf("GetState: %v", err)
+	if err := c.Assign(context.Background(), "issue1", "user_cyrus"); err != nil {
+		t.Fatalf("Assign: %v", err)
 	}
-	if state != "Done" {
-		t.Errorf("state = %q; want Done", state)
-	}
-}
-
-func TestComment(t *testing.T) {
-	fake := &fakeLinear{
-		t: t,
-		responsesFor: map[string]string{
-			"commentCreate": `{"data":{"commentCreate":{"success":true,"comment":{"id":"c1"}}}}`,
-		},
-	}
-	srv := httptest.NewServer(fake.handler())
-	defer srv.Close()
-
-	c := newClient(t, srv)
-	if err := c.Comment(context.Background(), "issue1", "PR opened: https://x"); err != nil {
-		t.Fatalf("Comment: %v", err)
-	}
-	// Verify the mutation carries both fields and the right name.
-	for _, needle := range []string{"commentCreate", `"id":"issue1"`, "PR opened"} {
+	for _, needle := range []string{"issueUpdate", `"id":"issue1"`, `"assignee":"user_cyrus"`, "assigneeId"} {
 		if !strings.Contains(fake.lastBody, needle) {
-			t.Errorf("Comment body missing %q; got:\n%s", needle, fake.lastBody)
+			t.Errorf("Assign body missing %q; got:\n%s", needle, fake.lastBody)
 		}
 	}
 }
 
-func TestComment_FailureSurfaced(t *testing.T) {
+func TestAssign_FailureSurfaced(t *testing.T) {
 	fake := &fakeLinear{
 		t: t,
 		responsesFor: map[string]string{
-			"commentCreate": `{"data":{"commentCreate":{"success":false}}}`,
+			"issueUpdate": `{"data":{"issueUpdate":{"success":false}}}`,
 		},
 	}
 	srv := httptest.NewServer(fake.handler())
 	defer srv.Close()
 
 	c := newClient(t, srv)
-	err := c.Comment(context.Background(), "issue1", "body")
+	err := c.Assign(context.Background(), "issue1", "user_cyrus")
 	if err == nil {
 		t.Fatal("expected error when success=false")
 	}
@@ -261,13 +234,12 @@ func TestQuery_GraphQLErrorsSurfaced(t *testing.T) {
 	}
 }
 
-// JSON-decode check: ensure our gqlIssueNode struct can round-trip
-// the canned response shape without nil-deref or silent field drops.
 func TestUnmarshalNode(t *testing.T) {
 	raw := `{
-		"id":"x","identifier":"MT-2","title":"t","description":"d",
-		"branchName":"b","url":"u","priority":2,
+		"id":"x","identifier":"NSI-2","title":"t","description":"d",
+		"url":"u","priority":2,
 		"state":{"name":"In Progress","type":"started"},
+		"assignee":{"id":"u1"},
 		"labels":{"nodes":[{"name":"a"},{"name":"B"}]},
 		"inverseRelations":{"nodes":[]},
 		"createdAt":"2026-01-01T00:00:00Z","updatedAt":"2026-01-02T00:00:00Z"
@@ -276,7 +248,10 @@ func TestUnmarshalNode(t *testing.T) {
 	if err := json.Unmarshal([]byte(raw), &n); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if n.Priority != 2 || n.State.Type != "started" || n.Identifier != "MT-2" {
+	if n.Priority != 2 || n.State.Type != "started" || n.Identifier != "NSI-2" {
 		t.Errorf("decoded fields wrong: %+v", n)
+	}
+	if n.Assignee == nil || n.Assignee.ID != "u1" {
+		t.Errorf("Assignee = %+v; want id u1", n.Assignee)
 	}
 }

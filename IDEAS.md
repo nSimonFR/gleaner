@@ -1,71 +1,64 @@
-# Ideas — not on the v0.0.x path
+# Ideas — not on the v0.2.x path
 
-Stuff considered, deliberately cut from v0.0.x. Promote out of here only when
-(a) v0.0.5 is running stably and (b) you can articulate which existing failure
-mode the idea addresses.
+Stuff considered, deliberately cut from v0.2.x. Gleaner is now a Linear
+picker that hands off to Cyrus. Promote out of here only when (a) the
+picker is running stably and (b) you can articulate which existing
+failure mode the idea addresses.
 
-## Executor profiles to ship as built-in defaults
+## Additional pickers — "automatic review and test"
 
-Each is config-only — no Go code, just new entries in
-`internal/executor/defaults.go`. Add when there's a real use case:
+The current `tick` only picks new Todo tickets. The same picker shape
+applies to two other Linear-visible states that Cyrus could be handed:
 
-- `opencastle-implement`: `npx opencastle run implement.convoy.yml` —
-  multi-agent dev/UI/DB/test specialists with quality gates
-  (`monkilabs/opencastle`)
-- `opencastle-review`: `npx opencastle run review.convoy.yml` — review-only
-  pass on an existing PR
-- `opencastle-cleanup`: same tool, cleanup convoy — for stale-code /
-  dead-flag removal tasks
-- `claude-review`: `claude -p "review this diff" --allowedTools "Read,Bash"`
-  for cheap per-PR sanity checks
-- `routines-fire`: POSTs to an Anthropic Routine's `/fire` endpoint as
-  fallback when local 5h cap is hit but Routines daily cap isn't. Inverts
-  trust model.
+- **review picker** — issues in a `Needs Review` state (or tickets
+  whose linked PR has `needs-review` and no human reviewer) get
+  reassigned to Cyrus with a review-mode hint. Requires Cyrus to
+  support a review session profile (currently it implements features).
+- **test picker** — issues/PRs in a `Needs Test` state get reassigned
+  to Cyrus to run the test suite, fix flakes, and update test
+  coverage. Cheaper per-tick than feature work; could share quota
+  budget with feature picks via a per-state weight.
 
-## Hook recipes for downstream consumers
+Shape: each picker is a small variant of `internal/picker/picker.go`
+with its own active-state filter and Cyrus dispatch mode. The quota
+gate and sort logic stay identical. Open questions before promoting:
 
-These live in the consuming system, not in gleaner:
-
-- Slack notifier hook script using existing webhook
-- Discord notifier hook script
-- Email digest hook (cron-summarizes the day's events from history)
-- Auto-archive hook: when `quota_cap_hit` fires, run `gh issue comment` on
-  every in-flight issue with "paused until reset"
-
-## Auto-merge
-
-- Reviewer heuristic (LOC delta + CI status + risk labels) → score
-- Auto-merge gate at score ≥ 0.95, max 50-line diff, repo allowlist (NEVER
-  the repo that hosts gleaner itself), never touches `**/*.nix` / `*.age` /
-  `flake.nix`
-- claude-reviewer Haiku scoring as richer alternative to heuristic — but
-  spending tokens to decide whether to spend tokens is suspicious; needs
-  justification
+- How does Cyrus learn what *mode* to run in? Linear ticket label, a
+  state name, or a dedicated comment template added at assignment
+  time?
+- Should review/test ticks compete with feature ticks for the same
+  quota budget, or get a separate sub-cap (e.g. "review can run when
+  feature is gated but long-window still has 30%")?
+- PR-level pickers (vs issue-level) would require Cyrus to accept a
+  PR id as the work item rather than a Linear issue id — open
+  question whether Linear's Agent session protocol supports that.
 
 ## Quota optimization
 
-- Warm-start Haiku ping at 22:55 to anchor the 5h window in night hours
-- Sub-bucket per-model routing: `complexity:trivial`→haiku, routine→sonnet,
-  hard→opus, with per-bucket ceilings (80/95/99)
-- Delta-safety abort: if one tool-call burns >15% of the short window, kill
-  the convoy
-- Cold-path filter: skip issues whose hint-files were modified on `main` in
-  last 24h (cache discipline)
-
-## Observability
-
-- Web UI at `:8088/` (not just JSON endpoint)
-- Weekly merge-rate alarm: if `merged_this_week` is 0 but utilization
-  climbed, fire an alert — structural anti-goal protection
-- Multi-day trend dashboard
-- HTTP `/trigger` endpoint for manual dispatch from another host
+- Warm-start Haiku ping at 22:55 to anchor the 5h window in night
+  hours.
+- Sub-bucket per-model routing: pick `complexity:trivial` issues only
+  when Haiku window is fresh, hard issues only when Opus is fresh.
+- Cold-path filter: skip issues whose hint-files were modified on
+  `main` in the last 24h (cache discipline).
 
 ## Routing
 
-- Issue body parsing for `files_touched_hint:` directive
-- Reviewer agent assignment instead of label
-- Multi-repo backlog pooling with priority queue
+- Multi-team backlog pooling: rank a unioned set of tickets across
+  several `team_key`s with a single priority queue. Today gleaner only
+  reads one team.
+- `files_touched_hint:` directive parsing — when an issue body lists
+  files, factor in whether those files are hot on the team's PR queue
+  (avoid stomping on someone's in-flight branch).
+
+## Observability
+
+- Web UI / homepage widget showing recent picks, current quota, and
+  reasons for skipped ticks.
+- Weekly merge-rate alarm: if `merged_this_week` is 0 but utilization
+  climbed, fire an alert — structural anti-goal protection.
 
 ## Storage
 
-- History retention: nothing to drop while stateless (GitHub keeps it)
+- History retention: gleaner is stateless. Linear keeps the assignment
+  audit trail; nothing to drop.
