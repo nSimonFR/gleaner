@@ -16,10 +16,23 @@
 //	  "seven_day_sonnet":   {"utilization": 0.0,  "resets_at": null},
 //	  "seven_day_omelette": {"utilization": 0.0,  "resets_at": null},
 //	  ...
+//	  "limits": [
+//	    {"kind": "session",       "group": "...", "percent": 83.0,
+//	     "severity": "warning", "is_active": true,
+//	     "resets_at": "...", "scope": "..."},
+//	    {"kind": "weekly_all",    ..., "is_active": false, ...},
+//	    {"kind": "weekly_scoped", ..., "is_active": true, ...}
+//	  ],
 //	  "extra_usage":        {"is_enabled": false, ...}
 //	}
 //
-// utilization is 0-100; we normalize to 0-1 to match codex.
+// utilization/percent is 0-100; we normalize to 0-1 to match codex.
+//
+// The newer limits[] array supersedes the per-window utilization fields
+// for gating: we pick the active gating limit (is_active && highest
+// percent, preferring severity "warning") and surface its resets_at +
+// capped flag via UsageSnapshot.ActiveLimit. five_hour/seven_day parsing
+// is retained as a back-compat fallback for responses without limits[].
 package claude_oauth
 
 import (
@@ -122,6 +135,14 @@ func (a *Adapter) Snapshot(ctx context.Context) (*adapter.UsageSnapshot, error) 
 		}
 	}
 
+	// limits[] — the newer cap-aware signal. When present, pick the active
+	// gating limit and surface it as snap.ActiveLimit.
+	if rawLimits, ok := raw["limits"]; ok && len(rawLimits) > 0 {
+		if al := decodeActiveLimit(rawLimits); al != nil {
+			snap.ActiveLimit = al
+		}
+	}
+
 	// extra_usage
 	if rawExtra, ok := raw["extra_usage"]; ok && len(rawExtra) > 0 {
 		var ex struct {
@@ -133,6 +154,84 @@ func (a *Adapter) Snapshot(ctx context.Context) (*adapter.UsageSnapshot, error) 
 	}
 
 	return snap, nil
+}
+
+// decodeActiveLimit parses the limits[] array and returns the gating
+// entry: the active limit (is_active:true) with the highest percent, with
+// a warning severity taking precedence over a higher-percent normal one.
+// Returns nil when no active limit is present or the array is malformed.
+func decodeActiveLimit(rm json.RawMessage) *adapter.ActiveLimit {
+	var limits []struct {
+		Kind     string   `json:"kind"`
+		Group    string   `json:"group"`
+		Percent  *float64 `json:"percent"`
+		Severity string   `json:"severity"`
+		IsActive bool     `json:"is_active"`
+		ResetsAt *string  `json:"resets_at"`
+		Scope    string   `json:"scope"`
+	}
+	if err := json.Unmarshal(rm, &limits); err != nil {
+		return nil
+	}
+
+	bestIdx := -1
+	for i, l := range limits {
+		if !l.IsActive {
+			continue
+		}
+		if bestIdx == -1 {
+			bestIdx = i
+			continue
+		}
+		best := limits[bestIdx]
+		// Prefer a warning severity over a non-warning one.
+		curWarn := limits[i].Severity == "warning"
+		bestWarn := best.Severity == "warning"
+		if curWarn != bestWarn {
+			if curWarn {
+				bestIdx = i
+			}
+			continue
+		}
+		// Same severity class: prefer the higher percent.
+		if pct(limits[i].Percent) > pct(best.Percent) {
+			bestIdx = i
+		}
+	}
+	if bestIdx == -1 {
+		return nil
+	}
+
+	l := limits[bestIdx]
+	al := &adapter.ActiveLimit{
+		Kind:        l.Kind,
+		Group:       l.Group,
+		UsedPercent: pct(l.Percent) / 100.0,
+		Severity:    l.Severity,
+		Scope:       l.Scope,
+	}
+	al.Capped = l.Severity == "warning" || pct(l.Percent) >= 100.0
+	if l.ResetsAt != nil && *l.ResetsAt != "" {
+		al.ResetsAt = parseTime(*l.ResetsAt)
+	}
+	return al
+}
+
+func pct(p *float64) float64 {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
+func parseTime(s string) *time.Time {
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return &t
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return &t
+	}
+	return nil
 }
 
 func readToken(path string) (token, subscriptionType string, err error) {
@@ -187,11 +286,7 @@ func decodeWindow(rm json.RawMessage, defaultMinutes int) (adapter.Window, bool)
 		Minutes:     defaultMinutes,
 	}
 	if v.ResetsAt != nil && *v.ResetsAt != "" {
-		if t, err := time.Parse(time.RFC3339Nano, *v.ResetsAt); err == nil {
-			w.ResetsAt = &t
-		} else if t, err := time.Parse(time.RFC3339, *v.ResetsAt); err == nil {
-			w.ResetsAt = &t
-		}
+		w.ResetsAt = parseTime(*v.ResetsAt)
 	}
 	return w, true
 }

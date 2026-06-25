@@ -106,6 +106,14 @@ func printHuman(r snapshotResult) {
 	if s.ExtraUsageEnabled {
 		fmt.Println("  extra_usage: enabled")
 	}
+	if al := s.ActiveLimit; al != nil {
+		cap := ""
+		if al.Capped {
+			cap = " CAPPED"
+		}
+		fmt.Printf("  active-limit: %s %s (%s)%s   %s\n",
+			al.Kind, formatPct(al.UsedPercent), al.Severity, cap, formatReset(al.ResetsAt))
+	}
 }
 
 func formatPct(p float64) string {
